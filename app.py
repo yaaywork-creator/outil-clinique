@@ -26,6 +26,9 @@ AZURE_DI_ENDPOINT = (os.getenv("AZURE_DI_ENDPOINT") or "").strip().rstrip("/")
 AZURE_DI_KEY = (os.getenv("AZURE_DI_KEY") or "").strip()
 AZURE_DI_API_VERSION = (os.getenv("AZURE_DI_API_VERSION") or "2024-11-30").strip()
 
+GOOGLE_CSE_API_KEY = (os.getenv("GOOGLE_CSE_API_KEY") or "").strip()
+GOOGLE_CSE_CX = (os.getenv("GOOGLE_CSE_CX") or "").strip()
+
 DB_FILE = "edd_exp_azure.db"
 UPLOAD_DIR = "uploaded_docs"
 Path(UPLOAD_DIR).mkdir(exist_ok=True)
@@ -48,7 +51,7 @@ st.markdown(
         color: white;
     }
     .block-container {
-        max-width: 1650px;
+        max-width: 1750px;
         padding-top: 1rem;
         padding-bottom: 2rem;
     }
@@ -103,6 +106,12 @@ check_password()
 # =========================================================
 # HELPERS
 # =========================================================
+def azure_is_configured():
+    return bool(AZURE_DI_ENDPOINT and AZURE_DI_KEY and AZURE_DI_API_VERSION)
+
+def google_cse_is_configured():
+    return bool(GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX)
+
 def metric_card(title, value, subtitle=""):
     st.markdown(
         f"""
@@ -243,6 +252,8 @@ def infer_doc_type_from_name(name: str) -> str:
         return "recu_cotisation"
     if "ordonnance" in n:
         return "ordonnance"
+    if "bon de livraison" in n or "bl" in n:
+        return "bon_livraison"
     return "facture"
 
 def ceil_precise(x):
@@ -250,11 +261,6 @@ def ceil_precise(x):
         return int(math.ceil(float(x)))
     except Exception:
         return 0
-
-def coalesce_str(a, b):
-    a = normalize_text(a)
-    b = normalize_text(b)
-    return a if a else b
 
 # =========================================================
 # DB
@@ -480,7 +486,7 @@ def init_db():
 init_db()
 
 # =========================================================
-# LEGAL PARAMS
+# PARAMS
 # =========================================================
 def get_legal_params():
     con = get_db_connection()
@@ -518,11 +524,8 @@ def save_legal_params(bam_rate_pct, default_delay_days, max_legal_delay_days):
     con.close()
 
 # =========================================================
-# AZURE
+# AZURE ANALYSIS
 # =========================================================
-def azure_is_configured():
-    return bool(AZURE_DI_ENDPOINT and AZURE_DI_KEY)
-
 def guess_content_type_from_name(filename: str) -> str:
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".pdf":
@@ -576,9 +579,6 @@ def azure_analyze_invoice(file_bytes: bytes, filename: str) -> dict:
     operation_location = azure_begin_invoice_analysis(file_bytes, filename)
     return azure_poll_result(operation_location)
 
-# =========================================================
-# EXTRACTION FACTURE
-# =========================================================
 def get_field_obj(fields: dict, candidates: list):
     if not isinstance(fields, dict):
         return None
@@ -657,28 +657,65 @@ def extract_regex_field(raw_text, patterns):
                 return val
     return None
 
-def extract_identity_fields(raw_text):
+def polygon_average_y(polygon):
+    if not polygon or len(polygon) < 8:
+        return None
+    ys = []
+    for i in range(1, len(polygon), 2):
+        try:
+            ys.append(float(polygon[i]))
+        except Exception:
+            pass
+    if not ys:
+        return None
+    return sum(ys) / len(ys)
+
+def extract_bottom_zone_text(result_json: dict, bottom_ratio: float = 0.72) -> str:
+    analyze_result = result_json.get("analyzeResult", {})
+    pages = analyze_result.get("pages", [])
+    collected = []
+
+    for page in pages:
+        page_height = page.get("height")
+        lines = page.get("lines", []) or []
+
+        if not page_height:
+            continue
+
+        for line in lines:
+            content = line.get("content", "")
+            polygon = line.get("polygon") or []
+            avg_y = polygon_average_y(polygon)
+
+            if avg_y is not None and avg_y >= float(page_height) * bottom_ratio:
+                if content:
+                    collected.append(content)
+
+    return "\n".join(collected)
+
+def extract_identity_fields_from_footer(result_json: dict):
+    footer_text = extract_bottom_zone_text(result_json, bottom_ratio=0.72)
+
     return {
-        "if_number": extract_regex_field(raw_text, [
+        "if_number": extract_regex_field(footer_text, [
             r"\bN[°ºo]?\s*d[’' ]?IF\s*[:\-]?\s*([A-Za-z0-9\/\-.]+)",
             r"\bIF\s*[:\-]?\s*([A-Za-z0-9\/\-.]+)",
         ]),
-        "ice_number": extract_regex_field(raw_text, [
+        "ice_number": extract_regex_field(footer_text, [
             r"\bN[°ºo]?\s*d[’' ]?ICE\s*[:\-]?\s*([A-Za-z0-9\/\-.]+)",
             r"\bICE\s*[:\-]?\s*([A-Za-z0-9\/\-.]+)",
         ]),
-        "rc_number": extract_regex_field(raw_text, [
+        "rc_number": extract_regex_field(footer_text, [
             r"\bN[°ºo]?\s*RC\s*[:\-]?\s*([A-Za-z0-9\/\-.]+)",
             r"\bRC\s*[:\-]?\s*([A-Za-z0-9\/\-.]+)",
         ]),
-        "head_office_address": extract_regex_field(raw_text, [
+        "head_office_address": extract_regex_field(footer_text, [
             r"Adresse\s+(?:du\s+)?si[eè]ge\s+social\s*[:\-]?\s*(.+)",
             r"Si[eè]ge\s+social\s*[:\-]?\s*(.+)",
-            r"Adresse\s*[:\-]?\s*(.+)",
+            r"Si[eè]ge\s*social\s*[:\-]?\s*(.+)",
         ]),
-        "rc_city": extract_regex_field(raw_text, [
+        "rc_city": extract_regex_field(footer_text, [
             r"Ville\s+du\s+RC\s*[:\-]?\s*(.+)",
-            r"Ville\s*[:\-]?\s*(.+)",
         ]),
     }
 
@@ -708,7 +745,7 @@ def normalize_azure_invoice_result(result_json: dict, filename: str, stored_path
         or "MAD"
     )
 
-    ids = extract_identity_fields(raw_text)
+    ids = extract_identity_fields_from_footer(result_json)
     doc_type = infer_doc_type_from_name(filename)
 
     items_field = get_field_obj(fields, ["Items"])
@@ -778,8 +815,208 @@ def normalize_azure_invoice_result(result_json: dict, filename: str, stored_path
     return doc, lines
 
 # =========================================================
-# CONVENTIONS / REMPLISSAGE
+# WEB ENRICHMENT
 # =========================================================
+def google_cse_search(query, num=5):
+    if not google_cse_is_configured():
+        return []
+
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": GOOGLE_CSE_API_KEY,
+        "cx": GOOGLE_CSE_CX,
+        "q": query,
+        "num": min(max(int(num), 1), 10),
+        "hl": "fr",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("items", []) or []
+    except Exception:
+        return []
+
+def extract_web_identity_from_text(text):
+    if not text:
+        return {}
+
+    out = {}
+
+    patterns = {
+        "ice_number": [
+            r"\bICE\s*[:\-]?\s*([0-9]{10,20})",
+            r"\bIdentifiant\s+commun\s+de\s+l[’']entreprise\s*[:\-]?\s*([0-9]{10,20})",
+        ],
+        "if_number": [
+            r"\bIF\s*[:\-]?\s*([0-9]{3,20})",
+            r"\bIdentifiant\s+fiscal\s*[:\-]?\s*([0-9]{3,20})",
+        ],
+        "rc_number": [
+            r"\bRC\s*[:\-]?\s*([0-9A-Za-z\/\-]{3,30})",
+            r"\bRegistre\s+de\s+commerce\s*[:\-]?\s*([0-9A-Za-z\/\-]{3,30})",
+        ],
+    }
+
+    for field, pats in patterns.items():
+        for p in pats:
+            m = re.search(p, text, flags=re.IGNORECASE)
+            if m:
+                out[field] = normalize_text(m.group(1))
+                break
+
+    addr = re.search(r"(adresse|si[eè]ge social)\s*[:\-]?\s*([^|•\n]{8,200})", text, flags=re.IGNORECASE)
+    if addr:
+        out["head_office_address"] = normalize_text(addr.group(2))
+
+    return out
+
+def enrich_supplier_row_from_web(row):
+    supplier_name = normalize_text(row.get("supplier_name"))
+    if not supplier_name:
+        return row
+
+    needs_any = any([
+        not normalize_text(row.get("if_number")),
+        not normalize_text(row.get("ice_number")),
+        not normalize_text(row.get("rc_number")),
+        not normalize_text(row.get("head_office_address")),
+        not normalize_text(row.get("rc_city")),
+    ])
+    if not needs_any:
+        return row
+
+    queries = [
+        f'"{supplier_name}" ICE IF RC adresse Maroc',
+        f'"{supplier_name}" "Identifiant Fiscal" "ICE" "RC"',
+        f'"{supplier_name}" "siège social" Maroc',
+    ]
+
+    found = {}
+    for q in queries:
+        results = google_cse_search(q, num=5)
+        combined_text = ""
+        for item in results:
+            combined_text += " " + str(item.get("title", ""))
+            combined_text += " " + str(item.get("snippet", ""))
+            if "pagemap" in item:
+                combined_text += " " + str(item.get("pagemap", ""))
+
+        partial = extract_web_identity_from_text(combined_text)
+        for k, v in partial.items():
+            if v and not found.get(k):
+                found[k] = v
+
+    row["if_number"] = normalize_text(row.get("if_number")) or found.get("if_number")
+    row["ice_number"] = normalize_text(row.get("ice_number")) or found.get("ice_number")
+    row["rc_number"] = normalize_text(row.get("rc_number")) or found.get("rc_number")
+    row["head_office_address"] = normalize_text(row.get("head_office_address")) or found.get("head_office_address")
+
+    if not normalize_text(row.get("rc_city")) and normalize_text(row.get("head_office_address")):
+        m = re.search(
+            r"(casablanca|rabat|marrakech|fes|fès|agadir|tanger|meknes|mekn[eè]s|oujda|kenitra|k[eé]nitra|tetouan|tétouan|safi|el jadida|beni mellal|b[eé]ni mellal|nador|mohammedia)",
+            row["head_office_address"],
+            flags=re.IGNORECASE
+        )
+        if m:
+            row["rc_city"] = normalize_text(m.group(1))
+
+    return row
+
+# =========================================================
+# BUSINESS RULES
+# =========================================================
+def infer_supplier_convention(supplier_name, invoice_number=None, invoice_date=None):
+    con = get_db_connection()
+    df = pd.read_sql_query("SELECT * FROM supplier_payment_terms WHERE active = 1", con)
+    con.close()
+
+    if df.empty:
+        return None
+
+    needed = [
+        "supplier_name", "supplier_name_normalized", "delay_days",
+        "if_number", "ice_number", "rc_number",
+        "head_office_address", "rc_city", "notes"
+    ]
+    for col in needed:
+        if col not in df.columns:
+            df[col] = None
+
+    norm = normalize_for_matching(supplier_name)
+    exact = df[df["supplier_name_normalized"] == norm].copy()
+
+    if exact.empty:
+        contains = df[df["supplier_name_normalized"].apply(lambda x: x in norm or norm in x if isinstance(x, str) else False)]
+        exact = contains.copy()
+
+    if exact.empty:
+        return None
+
+    if norm == normalize_for_matching("ANETT CASA") and invoice_number:
+        inv = str(invoice_number)
+        year = None
+        if invoice_date:
+            dt = to_date_obj(invoice_date)
+            if dt is not None and pd.notna(dt):
+                year = int(dt.year)
+
+        special = exact[exact["notes"].fillna("").str.contains("2024", case=False, na=False)]
+        if not special.empty and year == 2024 and any(x in inv for x in ["25050015", "25050009", "25050050"]):
+            return special.iloc[0].to_dict()
+
+        normal = exact[~exact["notes"].fillna("").str.contains("2024", case=False, na=False)]
+        if not normal.empty:
+            return normal.iloc[0].to_dict()
+
+    return exact.iloc[0].to_dict()
+
+def calculate_due_date(invoice_date, delay_days, default_delay_days=60, max_legal_delay_days=120):
+    dt = to_date_obj(invoice_date)
+    if dt is None or pd.isna(dt):
+        return None
+
+    if delay_days is None or pd.isna(delay_days):
+        return None
+
+    delay = parse_numeric_value(delay_days)
+    if pd.isna(delay):
+        return None
+
+    if delay > max_legal_delay_days:
+        delay = default_delay_days
+
+    return (dt + pd.Timedelta(days=int(delay))).date().isoformat()
+
+def compute_late_months_unpaid(unpaid_amount, due_date, settlement_date=None):
+    unpaid_amount = parse_numeric_value(unpaid_amount)
+    if pd.isna(unpaid_amount) or unpaid_amount <= 0:
+        return 0
+
+    due_dt = to_date_obj(due_date)
+    ref_dt = to_date_obj(settlement_date) if settlement_date else pd.Timestamp(datetime.now().date())
+
+    if due_dt is None or pd.isna(due_dt) or ref_dt is None or pd.isna(ref_dt):
+        return 0
+
+    days = (ref_dt - due_dt).days
+    if days <= 0:
+        return 0
+    return ceil_precise(days / 30)
+
+def build_goods_nature(lines_df, raw_text):
+    if lines_df is not None and not lines_df.empty and "designation" in lines_df.columns:
+        vals = lines_df["designation"].dropna().astype(str).tolist()
+        vals = [v.strip() for v in vals if v.strip()]
+        if vals:
+            return " ; ".join(vals[:8])
+
+    if raw_text:
+        m = re.search(r"(objet|designation|nature)\s*[:\-]?\s*(.+)", raw_text, flags=re.IGNORECASE)
+        if m:
+            return normalize_text(m.group(2))
+    return None
+
 def upsert_supplier_in_conventions(doc):
     supplier_name = normalize_text(doc.get("supplier_name"))
     if not supplier_name:
@@ -850,50 +1087,65 @@ def upsert_supplier_in_conventions(doc):
 
     con.close()
 
-def infer_supplier_convention(supplier_name, invoice_number=None, invoice_date=None):
-    con = get_db_connection()
-    df = pd.read_sql_query("SELECT * FROM supplier_payment_terms WHERE active = 1", con)
-    con.close()
+def create_payment_delay_record_from_document(document_row, lines_df):
+    params = get_legal_params()
 
-    if df.empty:
-        return None
+    supplier_name = normalize_text(document_row.get("supplier_name"))
+    invoice_number = normalize_text(document_row.get("invoice_number"))
+    invoice_date = parse_date_fr(document_row.get("document_date"))
+    raw_text = document_row.get("raw_text", "") or ""
 
-    needed = [
-        "supplier_name", "supplier_name_normalized", "delay_days",
-        "if_number", "ice_number", "rc_number",
-        "head_office_address", "rc_city", "notes"
-    ]
-    for col in needed:
-        if col not in df.columns:
-            df[col] = None
+    conv = infer_supplier_convention(supplier_name, invoice_number, invoice_date)
+    delay_days = conv.get("delay_days") if conv else None
 
-    norm = normalize_for_matching(supplier_name)
-    exact = df[df["supplier_name_normalized"] == norm].copy()
+    goods_nature = build_goods_nature(lines_df, raw_text)
 
-    if exact.empty:
-        contains = df[df["supplier_name_normalized"].apply(lambda x: x in norm or norm in x if isinstance(x, str) else False)]
-        exact = contains.copy()
+    delivery_date = invoice_date
+    if lines_df is not None and not lines_df.empty and "service_date" in lines_df.columns:
+        service_dates = lines_df["service_date"].dropna()
+        if len(service_dates) > 0:
+            delivery_date = pd.to_datetime(service_dates.iloc[0], errors="coerce")
+            if pd.notna(delivery_date):
+                delivery_date = delivery_date.date().isoformat()
+            else:
+                delivery_date = invoice_date
 
-    if exact.empty:
-        return None
+    due_date = calculate_due_date(
+        invoice_date=invoice_date,
+        delay_days=delay_days,
+        default_delay_days=params["default_delay_days"],
+        max_legal_delay_days=params["max_legal_delay_days"],
+    )
 
-    if norm == normalize_for_matching("ANETT CASA") and invoice_number:
-        inv = str(invoice_number)
-        year = None
-        if invoice_date:
-            dt = to_date_obj(invoice_date)
-            if dt is not None and pd.notna(dt):
-                year = int(dt.year)
+    amount_ttc = parse_numeric_value(document_row.get("total_ttc"))
+    unpaid_amount = amount_ttc if pd.notna(amount_ttc) else np.nan
+    late_months_unpaid = compute_late_months_unpaid(unpaid_amount, due_date, None)
 
-        special = exact[exact["notes"].fillna("").str.contains("2024", case=False, na=False)]
-        if not special.empty and year == 2024 and any(x in inv for x in ["25050015", "25050009", "25050050"]):
-            return special.iloc[0].to_dict()
-
-        normal = exact[~exact["notes"].fillna("").str.contains("2024", case=False, na=False)]
-        if not normal.empty:
-            return normal.iloc[0].to_dict()
-
-    return exact.iloc[0].to_dict()
+    return {
+        "record_id": str(uuid.uuid4()),
+        "source_document_id": document_row.get("document_id"),
+        "source_file": document_row.get("source_file"),
+        "supplier_name": supplier_name,
+        "invoice_number": invoice_number,
+        "invoice_date": invoice_date,
+        "goods_nature": goods_nature,
+        "delivery_date": delivery_date,
+        "trans_month": pd.to_datetime(invoice_date).month if invoice_date else None,
+        "trans_year": pd.to_datetime(invoice_date).year if invoice_date else None,
+        "sector_payment_delay_days": int(delay_days) if delay_days is not None and not pd.isna(delay_days) else None,
+        "due_date": due_date,
+        "settlement_date": None,
+        "amount_ttc": amount_ttc,
+        "unpaid_amount": amount_ttc if pd.notna(amount_ttc) else np.nan,
+        "late_months_unpaid": late_months_unpaid,
+        "amount_paid_late": 0.0,
+        "late_payment_date": None,
+        "payment_mode": normalize_text(document_row.get("payment_mode")),
+        "payment_reference": None,
+        "pecuniary_fine_amount": 0.0,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 # =========================================================
 # SAVE / LOAD
@@ -1119,114 +1371,130 @@ def load_all_data():
     return docs, lines, conventions, payment_delay
 
 # =========================================================
-# REGLES DELAI
+# BASE DOCUMENTS HELPERS
 # =========================================================
-def calculate_due_date(invoice_date, delay_days, default_delay_days=60, max_legal_delay_days=120):
-    dt = to_date_obj(invoice_date)
-    if dt is None or pd.isna(dt):
-        return None
+def load_document_with_lines(document_id):
+    con = get_db_connection()
+    doc = pd.read_sql_query(
+        "SELECT * FROM documents_achats WHERE document_id = ?",
+        con,
+        params=(document_id,)
+    )
+    lines = pd.read_sql_query(
+        "SELECT * FROM document_lines WHERE document_id = ? ORDER BY line_no",
+        con,
+        params=(document_id,)
+    )
+    con.close()
+    return doc, lines
 
-    if delay_days is None or pd.isna(delay_days):
-        return None
+def update_document_and_lines(document_id, doc_row, lines_df):
+    con = get_db_connection()
+    cur = con.cursor()
 
-    delay = parse_numeric_value(delay_days)
-    if pd.isna(delay):
-        return None
-
-    if delay > max_legal_delay_days:
-        delay = default_delay_days
-
-    return (dt + pd.Timedelta(days=int(delay))).date().isoformat()
-
-def compute_late_months_unpaid(unpaid_amount, due_date, settlement_date=None):
-    unpaid_amount = parse_numeric_value(unpaid_amount)
-    if pd.isna(unpaid_amount) or unpaid_amount <= 0:
-        return 0
-
-    due_dt = to_date_obj(due_date)
-    ref_dt = to_date_obj(settlement_date) if settlement_date else pd.Timestamp(datetime.now().date())
-
-    if due_dt is None or pd.isna(due_dt) or ref_dt is None or pd.isna(ref_dt):
-        return 0
-
-    days = (ref_dt - due_dt).days
-    if days <= 0:
-        return 0
-    return ceil_precise(days / 30)
-
-def build_goods_nature(lines_df, raw_text):
-    if lines_df is not None and not lines_df.empty and "designation" in lines_df.columns:
-        vals = lines_df["designation"].dropna().astype(str).tolist()
-        vals = [v.strip() for v in vals if v.strip()]
-        if vals:
-            return " ; ".join(vals[:8])
-
-    if raw_text:
-        m = re.search(r"(objet|designation|nature)\s*[:\-]?\s*(.+)", raw_text, flags=re.IGNORECASE)
-        if m:
-            return normalize_text(m.group(2))
-    return None
-
-def create_payment_delay_record_from_document(document_row, lines_df):
-    params = get_legal_params()
-
-    supplier_name = normalize_text(document_row.get("supplier_name"))
-    invoice_number = normalize_text(document_row.get("invoice_number"))
-    invoice_date = parse_date_fr(document_row.get("document_date"))
-    raw_text = document_row.get("raw_text", "") or ""
-
-    conv = infer_supplier_convention(supplier_name, invoice_number, invoice_date)
-    delay_days = conv.get("delay_days") if conv else None
-
-    goods_nature = build_goods_nature(lines_df, raw_text)
-
-    delivery_date = invoice_date
-    if lines_df is not None and not lines_df.empty and "service_date" in lines_df.columns:
-        service_dates = lines_df["service_date"].dropna()
-        if len(service_dates) > 0:
-            delivery_date = pd.to_datetime(service_dates.iloc[0], errors="coerce")
-            if pd.notna(delivery_date):
-                delivery_date = delivery_date.date().isoformat()
-            else:
-                delivery_date = invoice_date
-
-    due_date = calculate_due_date(
-        invoice_date=invoice_date,
-        delay_days=delay_days,
-        default_delay_days=params["default_delay_days"],
-        max_legal_delay_days=params["max_legal_delay_days"],
+    cur.execute(
+        """
+        UPDATE documents_achats
+        SET
+            source_file = ?,
+            doc_type = ?,
+            supplier_name = ?,
+            issuer_name = ?,
+            invoice_number = ?,
+            document_date = ?,
+            due_date = ?,
+            client_name = ?,
+            payment_mode = ?,
+            total_ht = ?,
+            total_tva = ?,
+            total_ttc = ?,
+            currency = ?,
+            if_number = ?,
+            ice_number = ?,
+            rc_number = ?,
+            head_office_address = ?,
+            rc_city = ?
+        WHERE document_id = ?
+        """,
+        (
+            normalize_text(doc_row.get("source_file")),
+            normalize_text(doc_row.get("doc_type")),
+            normalize_text(doc_row.get("supplier_name")),
+            normalize_text(doc_row.get("supplier_name")),
+            normalize_text(doc_row.get("invoice_number")),
+            parse_date_fr(doc_row.get("document_date")),
+            parse_date_fr(doc_row.get("due_date")),
+            normalize_text(doc_row.get("client_name")),
+            normalize_text(doc_row.get("payment_mode")),
+            parse_numeric_value(doc_row.get("total_ht")),
+            parse_numeric_value(doc_row.get("total_tva")),
+            parse_numeric_value(doc_row.get("total_ttc")),
+            normalize_text(doc_row.get("currency")) or "MAD",
+            normalize_text(doc_row.get("if_number")),
+            normalize_text(doc_row.get("ice_number")),
+            normalize_text(doc_row.get("rc_number")),
+            normalize_text(doc_row.get("head_office_address")),
+            normalize_text(doc_row.get("rc_city")),
+            document_id,
+        )
     )
 
-    amount_ttc = parse_numeric_value(document_row.get("total_ttc"))
-    unpaid_amount = amount_ttc if pd.notna(amount_ttc) else np.nan
-    late_months_unpaid = compute_late_months_unpaid(unpaid_amount, due_date, None)
+    cur.execute("DELETE FROM document_lines WHERE document_id = ?", (document_id,))
 
-    return {
-        "record_id": str(uuid.uuid4()),
-        "source_document_id": document_row.get("document_id"),
-        "source_file": document_row.get("source_file"),
-        "supplier_name": supplier_name,
-        "invoice_number": invoice_number,
-        "invoice_date": invoice_date,
-        "goods_nature": goods_nature,
-        "delivery_date": delivery_date,
-        "trans_month": pd.to_datetime(invoice_date).month if invoice_date else None,
-        "trans_year": pd.to_datetime(invoice_date).year if invoice_date else None,
-        "sector_payment_delay_days": int(delay_days) if delay_days is not None and not pd.isna(delay_days) else None,
-        "due_date": due_date,
-        "settlement_date": None,
-        "amount_ttc": amount_ttc,
-        "unpaid_amount": amount_ttc if pd.notna(amount_ttc) else np.nan,
-        "late_months_unpaid": late_months_unpaid,
-        "amount_paid_late": 0.0,
-        "late_payment_date": None,
-        "payment_mode": normalize_text(document_row.get("payment_mode")),
-        "payment_reference": None,
-        "pecuniary_fine_amount": 0.0,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
+    if lines_df is not None and not lines_df.empty:
+        temp_lines = lines_df.copy().reset_index(drop=True)
+        for idx, row in temp_lines.iterrows():
+            cur.execute(
+                """
+                INSERT INTO document_lines (
+                    line_id, document_id, source_file, line_no, reference,
+                    designation, service_date, quantity, unit_price_ht,
+                    unit_price_ttc, line_amount_ht, line_amount_ttc, raw_line
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    document_id,
+                    normalize_text(doc_row.get("source_file")),
+                    int(idx + 1),
+                    normalize_text(row.get("reference")),
+                    normalize_text(row.get("designation")),
+                    parse_date_fr(row.get("service_date")),
+                    parse_numeric_value(row.get("quantity")),
+                    parse_numeric_value(row.get("unit_price_ht")),
+                    parse_numeric_value(row.get("unit_price_ttc")),
+                    parse_numeric_value(row.get("line_amount_ht")),
+                    parse_numeric_value(row.get("line_amount_ttc")),
+                    normalize_text(row.get("raw_line")),
+                )
+            )
 
+    con.commit()
+    con.close()
+
+    upsert_supplier_in_conventions({
+        "supplier_name": normalize_text(doc_row.get("supplier_name")),
+        "if_number": normalize_text(doc_row.get("if_number")),
+        "ice_number": normalize_text(doc_row.get("ice_number")),
+        "rc_number": normalize_text(doc_row.get("rc_number")),
+        "head_office_address": normalize_text(doc_row.get("head_office_address")),
+        "rc_city": normalize_text(doc_row.get("rc_city")),
+    })
+
+def delete_document_and_related_data(document_id):
+    con = get_db_connection()
+    cur = con.cursor()
+
+    cur.execute("DELETE FROM payment_delay_records WHERE source_document_id = ?", (document_id,))
+    cur.execute("DELETE FROM document_lines WHERE document_id = ?", (document_id,))
+    cur.execute("DELETE FROM documents_achats WHERE document_id = ?", (document_id,))
+
+    con.commit()
+    con.close()
+
+# =========================================================
+# DELAI DISPLAY
+# =========================================================
 def build_payment_delay_display_df(payment_delay_df, docs_df, conventions_df):
     if payment_delay_df is None or payment_delay_df.empty:
         return pd.DataFrame()
@@ -1272,12 +1540,11 @@ def build_payment_delay_display_df(payment_delay_df, docs_df, conventions_df):
             suffixes=("", "_conv")
         )
 
-    # compléter les champs manquants depuis conventions
     for col in ["if_number", "ice_number", "rc_number", "head_office_address", "rc_city"]:
-        if f"{col}_conv" not in out.columns:
-            out[f"{col}_conv"] = None
         if col not in out.columns:
             out[col] = None
+        if f"{col}_conv" not in out.columns:
+            out[f"{col}_conv"] = None
         out[col] = out[col].where(out[col].notna() & (out[col].astype(str).str.strip() != ""), out[f"{col}_conv"])
 
     final_df = pd.DataFrame({
@@ -1435,7 +1702,7 @@ def build_excel_report(docs_df, delay_export_df, penalties_df, conventions_df):
     return output.getvalue()
 
 # =========================================================
-# LOAD DATA
+# LOAD GLOBAL DATA
 # =========================================================
 docs_df, lines_df, conventions_df, payment_delay_df = load_all_data()
 params = get_legal_params()
@@ -1500,7 +1767,7 @@ elif menu == "Import & Extraction":
     )
 
     if not azure_is_configured():
-        st.error("Azure DI n'est pas configuré. Ajoute AZURE_DI_ENDPOINT et AZURE_DI_KEY dans .env")
+        st.warning("Azure n'est pas configuré. Remplis AZURE_DI_ENDPOINT et AZURE_DI_KEY dans le fichier .env pour l'extraction IA.")
         st.stop()
 
     if not files:
@@ -1622,10 +1889,90 @@ elif menu == "Base Documents":
     cols = [
         "document_id", "source_file", "supplier_name", "invoice_number",
         "document_date", "payment_mode", "total_ht", "total_tva", "total_ttc",
-        "currency", "if_number", "ice_number", "rc_number", "head_office_address", "rc_city", "created_at"
+        "currency", "if_number", "ice_number", "rc_number",
+        "head_office_address", "rc_city", "created_at"
     ]
     cols = [c for c in cols if c in show.columns]
     st.dataframe(show[cols], use_container_width=True, hide_index=True)
+
+    st.markdown("### Modifier un document")
+
+    options_df = docs_df.copy()
+    options_df["label"] = (
+        options_df["supplier_name"].fillna("Sans fournisseur").astype(str)
+        + " | "
+        + options_df["invoice_number"].fillna("Sans numéro").astype(str)
+        + " | "
+        + options_df["source_file"].fillna("").astype(str)
+    )
+
+    selected_label = st.selectbox(
+        "Choisir un document",
+        options_df["label"].tolist()
+    )
+
+    selected_id = options_df.loc[options_df["label"] == selected_label, "document_id"].iloc[0]
+
+    doc_one, lines_one = load_document_with_lines(selected_id)
+
+    if doc_one.empty:
+        st.warning("Document introuvable.")
+        st.stop()
+
+    doc_edit_cols = [
+        "source_file", "doc_type", "supplier_name", "invoice_number",
+        "document_date", "due_date", "client_name", "payment_mode",
+        "total_ht", "total_tva", "total_ttc", "currency",
+        "if_number", "ice_number", "rc_number",
+        "head_office_address", "rc_city"
+    ]
+
+    for col in doc_edit_cols:
+        if col not in doc_one.columns:
+            doc_one[col] = None
+
+    doc_editor = st.data_editor(
+        doc_one[doc_edit_cols],
+        use_container_width=True,
+        num_rows="fixed",
+        key="base_doc_editor"
+    )
+
+    line_edit_cols = [
+        "reference", "designation", "service_date", "quantity",
+        "unit_price_ht", "unit_price_ttc", "line_amount_ht",
+        "line_amount_ttc", "raw_line"
+    ]
+    for col in line_edit_cols:
+        if col not in lines_one.columns:
+            lines_one[col] = None
+
+    st.markdown("#### Lignes du document")
+    lines_editor = st.data_editor(
+        lines_one[line_edit_cols],
+        use_container_width=True,
+        num_rows="dynamic",
+        key="base_lines_editor"
+    )
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("Enregistrer les modifications du document", use_container_width=True):
+            row0 = doc_editor.iloc[0].to_dict()
+            update_document_and_lines(selected_id, row0, lines_editor)
+            st.success("Document modifié avec succès.")
+            st.rerun()
+
+    with c2:
+        confirm_delete = st.checkbox("Confirmer la suppression du document sélectionné")
+        if st.button("Supprimer ce document", use_container_width=True, type="secondary"):
+            if not confirm_delete:
+                st.error("Coche d'abord la confirmation de suppression.")
+            else:
+                delete_document_and_related_data(selected_id)
+                st.success("Document supprimé avec succès.")
+                st.rerun()
 
 # =========================================================
 # PAGE DELAI DE PAIEMENT
@@ -1759,18 +2106,6 @@ elif menu == "Délai de paiement":
         st.success("Table délai de paiement enregistrée.")
         st.rerun()
 
-    st.markdown("### KPIs délai de paiement")
-    d1, d2, d3, d4 = st.columns(4)
-    with d1:
-        metric_card("Lignes", str(len(edited)))
-    with d2:
-        metric_card("Montant TTC", format_money(pd.to_numeric(edited["Montant de la facture TTC"], errors="coerce").fillna(0).sum()))
-    with d3:
-        metric_card("Montant non payé", format_money(pd.to_numeric(edited["Montant non encore payé de la facture"], errors="coerce").fillna(0).sum()))
-    with d4:
-        late_lines = (pd.to_numeric(edited["Nombre des mois de retard afférent au montant non encore payé"], errors="coerce").fillna(0) > 0).sum()
-        metric_card("Factures en retard", str(int(late_lines)))
-
 # =========================================================
 # PAGE PENALITES
 # =========================================================
@@ -1806,23 +2141,6 @@ elif menu == "Pénalités":
 
     st.dataframe(penalties_df, use_container_width=True, hide_index=True)
 
-    p1, p2 = st.columns(2)
-    with p1:
-        by_supplier = penalties_df.groupby("Fournisseur", dropna=False)["Amende à Payer"].sum().reset_index().sort_values("Amende à Payer", ascending=False)
-        if not by_supplier.empty:
-            fig = px.bar(by_supplier.head(15), x="Fournisseur", y="Amende à Payer", title="Top fournisseurs par amende")
-            st.plotly_chart(style_plot(fig), use_container_width=True)
-
-    with p2:
-        temp = payment_delay_df.copy()
-        temp["invoice_month"] = pd.to_datetime(temp["invoice_date"], errors="coerce").dt.to_period("M").astype(str)
-        monthly_pen = penalties_df.copy()
-        monthly_pen["invoice_month"] = temp["invoice_month"]
-        by_month = monthly_pen.groupby("invoice_month", dropna=False)["Amende à Payer"].sum().reset_index()
-        if not by_month.empty:
-            fig = px.line(by_month, x="invoice_month", y="Amende à Payer", markers=True, title="Evolution mensuelle des amendes")
-            st.plotly_chart(style_plot(fig), use_container_width=True)
-
 # =========================================================
 # PAGE CONVENTIONS
 # =========================================================
@@ -1837,7 +2155,7 @@ elif menu == "Conventions délais fournisseurs":
             "rc_number", "head_office_address", "rc_city", "notes", "active"
         ])
 
-    st.info("Tu peux modifier ici les données manuellement. Les infos manquantes seront reprises ici pour le délai de paiement.")
+    st.info("Tu peux modifier ici manuellement les données. Si la facture ne contient pas IF / ICE / RC / adresse / ville, l'app les reprend ici.")
 
     conv_cols = [
         "supplier_name",
@@ -1861,10 +2179,33 @@ elif menu == "Conventions délais fournisseurs":
         key="terms_editor"
     )
 
-    if st.button("Enregistrer les conventions fournisseurs", use_container_width=True):
-        save_conventions_df(edited_terms)
-        st.success("Conventions enregistrées.")
-        st.rerun()
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        if st.button("Enregistrer les conventions fournisseurs", use_container_width=True):
+            save_conventions_df(edited_terms)
+            st.success("Conventions enregistrées.")
+            st.rerun()
+
+    with col_b:
+        if st.button("Compléter automatiquement les conventions via web", use_container_width=True):
+            if not google_cse_is_configured():
+                st.error("Tu dois remplir GOOGLE_CSE_API_KEY et GOOGLE_CSE_CX dans le fichier .env")
+            else:
+                enriched = edited_terms.copy()
+                progress = st.progress(0)
+                total = len(enriched) if len(enriched) > 0 else 1
+
+                for i in range(len(enriched)):
+                    row = enriched.iloc[i].copy()
+                    row = enrich_supplier_row_from_web(row)
+                    for col in enriched.columns:
+                        enriched.at[i, col] = row.get(col)
+                    progress.progress((i + 1) / total)
+
+                save_conventions_df(enriched)
+                st.success("Enrichissement web terminé. Vérifie quand même les résultats.")
+                st.rerun()
 
     delay_export_df = build_payment_delay_display_df(payment_delay_df, docs_df, conventions_df)
     delay_export_df = delay_export_df.drop(columns=["_record_id", "_source_document_id", "_source_file"], errors="ignore")

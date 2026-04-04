@@ -8,3 +8,4 @@ xlsxwriter
 reportlab
 duckdb
 python-dotenv
+beautifulsoup4
