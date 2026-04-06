@@ -2330,16 +2330,8 @@ elif menu == "Import & Extraction":
                     if c in edited_lines.columns:
                         edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
 
-            auto_save_key = f"auto_saved::{stored_path}"
-
-            if auto_save and not st.session_state.get(auto_save_key, False):
-                doc_id = save_document_to_db(doc_to_save, edited_lines)
-                st.session_state[auto_save_key] = True
-                st.success(f"Document enregistré automatiquement. ID : {doc_id}")
-
             if st.button(f"Enregistrer / mettre à jour {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
                 doc_id = save_document_to_db(doc_to_save, edited_lines)
-                st.session_state[auto_save_key] = True
                 st.success(f"Document enregistré avec succès. ID : {doc_id}")
                 st.rerun()
 
