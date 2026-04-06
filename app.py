@@ -14,13 +14,12 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-from dotenv import load_dotenv
-import psycopg2
-from psycopg2.extras import RealDictCursor
-DATABASE_URL = st.secrets["DATABASE_URL"]
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 # =========================================================
 # CONFIG
@@ -42,6 +41,7 @@ DB_FILE = DATA_DIR / "edd_exp_azure.db"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 st.set_page_config(
     page_title="EDDAQAQ EXP",
     page_icon="📊",
@@ -319,18 +319,21 @@ def init_db():
         )
         """
     )
-cur.execute("""
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_unique_invoice
-    ON documents_achats (
-        supplier_name,
-        invoice_number,
-        document_date,
-        total_ttc
-    )
-""")
 
     for col in ["if_number", "ice_number", "rc_number", "head_office_address", "rc_city"]:
         safe_add_column(cur, "documents_achats", col, "TEXT")
+
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_unique_invoice
+        ON documents_achats (
+            supplier_name,
+            invoice_number,
+            document_date,
+            total_ttc
+        )
+        """
+    )
 
     cur.execute(
         """
@@ -1169,6 +1172,7 @@ def create_payment_delay_record_from_document(document_row, lines_df):
 # =========================================================
 # SAVE / LOAD
 # =========================================================
+
 def save_document_to_db(doc, lines_df):
     con = get_db_connection()
     cur = con.cursor()
@@ -1178,7 +1182,6 @@ def save_document_to_db(doc, lines_df):
     document_date = parse_date_fr(doc.get("document_date")) if doc.get("document_date") else None
     total_ttc = parse_numeric_value(doc.get("total_ttc"))
 
-    # Vérifie si la facture existe déjà
     cur.execute(
         """
         SELECT document_id
@@ -1289,7 +1292,8 @@ def save_document_to_db(doc, lines_df):
         )
 
     if lines_df is not None and not lines_df.empty:
-        for _, row in lines_df.iterrows():
+        temp_lines = lines_df.copy().reset_index(drop=True)
+        for idx, row in temp_lines.iterrows():
             cur.execute(
                 """
                 INSERT INTO document_lines (
@@ -1302,7 +1306,7 @@ def save_document_to_db(doc, lines_df):
                     str(uuid.uuid4()),
                     document_id,
                     doc.get("source_file"),
-                    int(row["line_no"]) if pd.notna(row.get("line_no")) else None,
+                    int(row["line_no"]) if pd.notna(row.get("line_no")) else int(idx + 1),
                     normalize_text(row.get("reference")),
                     normalize_text(row.get("designation")),
                     parse_date_fr(row.get("service_date")) if row.get("service_date") else None,
@@ -1320,6 +1324,7 @@ def save_document_to_db(doc, lines_df):
 
     upsert_supplier_in_conventions(doc)
     return document_id
+
 
 def save_conventions_df(df):
     con = get_db_connection()
@@ -1861,6 +1866,7 @@ elif menu == "Import & Extraction":
         type=["pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
         accept_multiple_files=True,
     )
+
     auto_save = st.checkbox("Enregistrer automatiquement chaque facture importée", value=True)
 
     if not azure_is_configured():
@@ -1933,42 +1939,46 @@ elif menu == "Import & Extraction":
 
             row0 = edited_doc.iloc[0]
 
-doc_to_save = {
-    "source_file": file.name,
-    "stored_file_path": stored_path,
-    "doc_type": normalize_text(row0.get("doc_type")),
-    "supplier_name": normalize_text(row0.get("supplier_name")),
-    "issuer_name": normalize_text(row0.get("supplier_name")),
-    "invoice_number": normalize_text(row0.get("invoice_number")),
-    "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
-    "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
-    "client_name": normalize_text(row0.get("client_name")),
-    "payment_mode": normalize_text(row0.get("payment_mode")),
-    "total_ht": parse_numeric_value(row0.get("total_ht")),
-    "total_tva": parse_numeric_value(row0.get("total_tva")),
-    "total_ttc": parse_numeric_value(row0.get("total_ttc")),
-    "currency": normalize_text(row0.get("currency")) or "MAD",
-    "raw_text": doc.get("raw_text", ""),
-    "if_number": normalize_text(row0.get("if_number")),
-    "ice_number": normalize_text(row0.get("ice_number")),
-    "rc_number": normalize_text(row0.get("rc_number")),
-    "head_office_address": normalize_text(row0.get("head_office_address")),
-    "rc_city": normalize_text(row0.get("rc_city")),
-}
+            doc_to_save = {
+                "source_file": file.name,
+                "stored_file_path": stored_path,
+                "doc_type": normalize_text(row0.get("doc_type")),
+                "supplier_name": normalize_text(row0.get("supplier_name")),
+                "issuer_name": normalize_text(row0.get("supplier_name")),
+                "invoice_number": normalize_text(row0.get("invoice_number")),
+                "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
+                "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
+                "client_name": normalize_text(row0.get("client_name")),
+                "payment_mode": normalize_text(row0.get("payment_mode")),
+                "total_ht": parse_numeric_value(row0.get("total_ht")),
+                "total_tva": parse_numeric_value(row0.get("total_tva")),
+                "total_ttc": parse_numeric_value(row0.get("total_ttc")),
+                "currency": normalize_text(row0.get("currency")) or "MAD",
+                "raw_text": doc.get("raw_text", ""),
+                "if_number": normalize_text(row0.get("if_number")),
+                "ice_number": normalize_text(row0.get("ice_number")),
+                "rc_number": normalize_text(row0.get("rc_number")),
+                "head_office_address": normalize_text(row0.get("head_office_address")),
+                "rc_city": normalize_text(row0.get("rc_city")),
+            }
 
-if not edited_lines.empty:
-    for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
-        if c in edited_lines.columns:
-            edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
+            if not edited_lines.empty:
+                for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
+                    if c in edited_lines.columns:
+                        edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
 
-if auto_save:
-    doc_id = save_document_to_db(doc_to_save, edited_lines)
-    st.success(f"Facture enregistrée automatiquement. ID : {doc_id}")
-else:
-    if st.button(f"Enregistrer {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
-        doc_id = save_document_to_db(doc_to_save, edited_lines)
-        st.success(f"Document enregistré avec succès. ID : {doc_id}")
-        st.rerun()
+            auto_save_key = f"auto_saved::{stored_path}"
+
+            if auto_save and not st.session_state.get(auto_save_key, False):
+                doc_id = save_document_to_db(doc_to_save, edited_lines)
+                st.session_state[auto_save_key] = True
+                st.success(f"Document enregistré automatiquement. ID : {doc_id}")
+
+            if st.button(f"Enregistrer / mettre à jour {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
+                doc_id = save_document_to_db(doc_to_save, edited_lines)
+                st.session_state[auto_save_key] = True
+                st.success(f"Document enregistré avec succès. ID : {doc_id}")
+                st.rerun()
 
 # =========================================================
 # PAGE BASE DOCUMENTS
