@@ -90,7 +90,7 @@ def check_password():
     if st.session_state.get("authenticated", False):
         return True
 
-    st.title("EDDAQAQ EXP")
+    st.title("EDDAQAQ EXPERTISES")
     st.info("Accès sécurisé")
 
     pwd = st.text_input("Mot de passe", type="password")
@@ -1862,7 +1862,7 @@ params = get_legal_params()
 # =========================================================
 # SIDEBAR
 # =========================================================
-st.sidebar.title("EDDAQAQ EXP")
+st.sidebar.title("EDDAQAQ EXPERTISES")
 menu = st.sidebar.radio(
     "Navigation",
     [
@@ -1883,7 +1883,7 @@ if st.sidebar.button("Déconnexion", use_container_width=True):
 # PAGE ACCUEIL
 # =========================================================
 if menu == "Accueil":
-    st.title("Plateforme EDDAQAQ EXP")
+    st.title("Plateforme EDDAQAQ EXPERTISES")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
