@@ -564,57 +564,27 @@ def guess_content_type_from_name(filename: str) -> str:
         return "image/webp"
     return "application/octet-stream"
 
-import random
-
 def azure_begin_invoice_analysis(file_bytes: bytes, filename: str) -> str:
     url = f"{AZURE_DI_ENDPOINT}/documentintelligence/documentModels/prebuilt-invoice:analyze?api-version={AZURE_DI_API_VERSION}"
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_DI_KEY,
         "Content-Type": guess_content_type_from_name(filename),
     }
+    resp = requests.post(url, headers=headers, data=file_bytes, timeout=120)
+    resp.raise_for_status()
+    operation_location = resp.headers.get("Operation-Location")
+    if not operation_location:
+        raise RuntimeError("Azure n'a pas renvoyé Operation-Location.")
+    return operation_location
 
-    max_attempts = 6
-    delay = 2
-
-    for _ in range(max_attempts):
-        resp = requests.post(url, headers=headers, data=file_bytes, timeout=120)
-
-        if resp.status_code in (200, 201, 202):
-            operation_location = resp.headers.get("Operation-Location")
-            if not operation_location:
-                raise RuntimeError("Azure n'a pas renvoyé Operation-Location.")
-            return operation_location
-
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            wait_time = int(retry_after) if retry_after and retry_after.isdigit() else delay
-            time.sleep(wait_time + random.uniform(0, 1))
-            delay = min(delay * 2, 30)
-            continue
-
-        resp.raise_for_status()
-
-    raise RuntimeError("Trop de requêtes Azure. Réessaie dans quelques secondes.")
-
-def azure_poll_result(operation_location: str, timeout_seconds: int = 300) -> dict:
+def azure_poll_result(operation_location: str, timeout_seconds: int = 180) -> dict:
     start = time.time()
-    delay = 2
-    max_delay = 15
-
     while True:
         resp = requests.get(
             operation_location,
             headers={"Ocp-Apim-Subscription-Key": AZURE_DI_KEY},
             timeout=120,
         )
-
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            wait_time = int(retry_after) if retry_after and retry_after.isdigit() else delay
-            time.sleep(wait_time)
-            delay = min(delay * 2, max_delay)
-            continue
-
         resp.raise_for_status()
         data = resp.json()
         status = data.get("status", "").lower()
@@ -623,12 +593,9 @@ def azure_poll_result(operation_location: str, timeout_seconds: int = 300) -> di
             return data
         if status == "failed":
             raise RuntimeError(f"Azure a échoué : {data}")
-
         if time.time() - start > timeout_seconds:
             raise TimeoutError("Délai dépassé pendant l'analyse Azure.")
-
-        time.sleep(delay)
-        delay = min(delay + 1, max_delay)
+        time.sleep(2)
 
 def azure_analyze_invoice(file_bytes: bytes, filename: str) -> dict:
     operation_location = azure_begin_invoice_analysis(file_bytes, filename)
@@ -1251,7 +1218,8 @@ def save_document_to_db(doc, lines_df):
                 total_ht = ?,
                 total_tva = ?,
                 total_ttc = ?,
-                    raw_text = ?,
+                currency = ?,
+                raw_text = ?,
                 if_number = ?,
                 ice_number = ?,
                 rc_number = ?,
@@ -1541,6 +1509,7 @@ def update_document_and_lines(document_id, doc_row, lines_df):
             total_ht = ?,
             total_tva = ?,
             total_ttc = ?,
+            currency = ?,
             if_number = ?,
             ice_number = ?,
             rc_number = ?,
@@ -1561,6 +1530,7 @@ def update_document_and_lines(document_id, doc_row, lines_df):
             parse_numeric_value(doc_row.get("total_ht")),
             parse_numeric_value(doc_row.get("total_tva")),
             parse_numeric_value(doc_row.get("total_ttc")),
+            normalize_text(doc_row.get("currency")) or "MAD",
             normalize_text(doc_row.get("if_number")),
             normalize_text(doc_row.get("ice_number")),
             normalize_text(doc_row.get("rc_number")),
@@ -1832,228 +1802,6 @@ def build_excel_report(docs_df, delay_export_df, penalties_df, conventions_df):
     output.seek(0)
     return output.getvalue()
 
-
-
-# =========================================================
-# ANALYSE FOURNISSEUR / AUDIT
-# =========================================================
-def build_supplier_analysis(docs_df, lines_df, payment_delay_df, supplier_name):
-    docs = docs_df.copy() if docs_df is not None else pd.DataFrame()
-    lines = lines_df.copy() if lines_df is not None else pd.DataFrame()
-    delays = payment_delay_df.copy() if payment_delay_df is not None else pd.DataFrame()
-
-    if docs.empty or not supplier_name:
-        return {
-            "docs": pd.DataFrame(),
-            "lines": pd.DataFrame(),
-            "delays": pd.DataFrame(),
-            "monthly": pd.DataFrame(),
-            "top_designations": pd.DataFrame(),
-            "payment_modes": pd.DataFrame(),
-            "doc_types": pd.DataFrame(),
-            "audit_duplicates": pd.DataFrame(),
-            "missing_fields": pd.DataFrame(),
-            "unit_price_alerts": pd.DataFrame(),
-            "line_summary": pd.DataFrame(),
-            "kpis": {}
-        }
-
-    docs["supplier_name_norm"] = docs["supplier_name"].apply(normalize_for_matching)
-    target_norm = normalize_for_matching(supplier_name)
-    supplier_docs = docs[docs["supplier_name_norm"] == target_norm].copy()
-
-    if supplier_docs.empty:
-        return {
-            "docs": pd.DataFrame(),
-            "lines": pd.DataFrame(),
-            "delays": pd.DataFrame(),
-            "monthly": pd.DataFrame(),
-            "top_designations": pd.DataFrame(),
-            "payment_modes": pd.DataFrame(),
-            "doc_types": pd.DataFrame(),
-            "audit_duplicates": pd.DataFrame(),
-            "missing_fields": pd.DataFrame(),
-            "unit_price_alerts": pd.DataFrame(),
-            "line_summary": pd.DataFrame(),
-            "kpis": {}
-        }
-
-    supplier_doc_ids = supplier_docs["document_id"].astype(str).tolist()
-
-    supplier_lines = pd.DataFrame()
-    if lines is not None and not lines.empty and "document_id" in lines.columns:
-        supplier_lines = lines[lines["document_id"].astype(str).isin(supplier_doc_ids)].copy()
-
-    supplier_delays = pd.DataFrame()
-    if delays is not None and not delays.empty and "source_document_id" in delays.columns:
-        supplier_delays = delays[delays["source_document_id"].astype(str).isin(supplier_doc_ids)].copy()
-
-    supplier_docs["year_month"] = supplier_docs["document_date"].dt.strftime("%Y-%m").fillna("Sans date")
-
-    monthly = (
-        supplier_docs.groupby("year_month", dropna=False)
-        .agg(
-            montant_ttc=("total_ttc", "sum"),
-            nb_factures=("document_id", "count"),
-            montant_ht=("total_ht", "sum"),
-            montant_tva=("total_tva", "sum"),
-        )
-        .reset_index()
-        .sort_values("year_month")
-    )
-
-    payment_modes = pd.DataFrame()
-    if "payment_mode" in supplier_docs.columns:
-        payment_modes = (
-            supplier_docs.assign(payment_mode=supplier_docs["payment_mode"].fillna("Non renseigné"))
-            .groupby("payment_mode", dropna=False)
-            .agg(nb_factures=("document_id", "count"), montant_ttc=("total_ttc", "sum"))
-            .reset_index()
-            .sort_values("montant_ttc", ascending=False)
-        )
-
-    doc_types = pd.DataFrame()
-    if "doc_type" in supplier_docs.columns:
-        doc_types = (
-            supplier_docs.assign(doc_type=supplier_docs["doc_type"].fillna("Non renseigné"))
-            .groupby("doc_type", dropna=False)
-            .agg(nb_documents=("document_id", "count"), montant_ttc=("total_ttc", "sum"))
-            .reset_index()
-            .sort_values("montant_ttc", ascending=False)
-        )
-
-    top_designations = pd.DataFrame()
-    line_summary = pd.DataFrame()
-    unit_price_alerts = pd.DataFrame()
-
-    if not supplier_lines.empty:
-        supplier_lines["designation_clean"] = supplier_lines["designation"].fillna("Non renseigné").astype(str).str.strip()
-        top_designations = (
-            supplier_lines.groupby("designation_clean", dropna=False)
-            .agg(
-                montant_ttc=("line_amount_ttc", "sum"),
-                montant_ht=("line_amount_ht", "sum"),
-                quantite=("quantity", "sum"),
-                nb_lignes=("line_id", "count"),
-            )
-            .reset_index()
-            .sort_values("montant_ttc", ascending=False)
-            .head(12)
-        )
-
-        line_summary = (
-            supplier_lines.groupby("designation_clean", dropna=False)
-            .agg(
-                pu_ht_moyen=("unit_price_ht", "mean"),
-                pu_ht_min=("unit_price_ht", "min"),
-                pu_ht_max=("unit_price_ht", "max"),
-                nb_lignes=("line_id", "count"),
-            )
-            .reset_index()
-        )
-        line_summary["ecart_pu_pct"] = np.where(
-            line_summary["pu_ht_moyen"].fillna(0) > 0,
-            ((line_summary["pu_ht_max"].fillna(0) - line_summary["pu_ht_min"].fillna(0)) / line_summary["pu_ht_moyen"].replace(0, np.nan)) * 100,
-            np.nan
-        )
-
-        unit_price_alerts = (
-            line_summary[
-                (line_summary["nb_lignes"].fillna(0) >= 2)
-                & (line_summary["ecart_pu_pct"].fillna(0) >= 20)
-            ]
-            .sort_values(["ecart_pu_pct", "nb_lignes"], ascending=[False, False])
-            .head(20)
-        )
-
-    audit_duplicates = supplier_docs.copy()
-    audit_duplicates["dup_invoice_number"] = audit_duplicates["invoice_number"].fillna("").astype(str).str.strip()
-    audit_duplicates["dup_amount_date"] = (
-        audit_duplicates["document_date"].dt.strftime("%Y-%m-%d").fillna("")
-        + "|"
-        + audit_duplicates["total_ttc"].fillna(0).round(2).astype(str)
-    )
-
-    invoice_dups = audit_duplicates[
-        audit_duplicates["dup_invoice_number"].ne("")
-    ].groupby("dup_invoice_number").filter(lambda g: len(g) > 1)
-
-    amount_date_dups = audit_duplicates.groupby("dup_amount_date").filter(lambda g: len(g) > 1)
-
-    audit_duplicates = pd.concat([invoice_dups, amount_date_dups], ignore_index=True).drop_duplicates(subset=["document_id"])
-    if not audit_duplicates.empty:
-        audit_duplicates = audit_duplicates[[
-            "source_file", "invoice_number", "document_date", "total_ttc", "payment_mode", "doc_type"
-        ]].sort_values(["document_date", "total_ttc"], ascending=[False, False])
-
-    missing_fields = pd.DataFrame({
-        "Champ": ["N° facture", "Date facture", "Montant TTC", "IF", "ICE", "RC", "Adresse siège", "Ville RC", "Mode paiement"],
-        "Nb manquants": [
-            supplier_docs["invoice_number"].isna().sum() + (supplier_docs["invoice_number"].fillna("").astype(str).str.strip() == "").sum(),
-            supplier_docs["document_date"].isna().sum(),
-            supplier_docs["total_ttc"].isna().sum(),
-            supplier_docs["if_number"].isna().sum() + (supplier_docs["if_number"].fillna("").astype(str).str.strip() == "").sum(),
-            supplier_docs["ice_number"].isna().sum() + (supplier_docs["ice_number"].fillna("").astype(str).str.strip() == "").sum(),
-            supplier_docs["rc_number"].isna().sum() + (supplier_docs["rc_number"].fillna("").astype(str).str.strip() == "").sum(),
-            supplier_docs["head_office_address"].isna().sum() + (supplier_docs["head_office_address"].fillna("").astype(str).str.strip() == "").sum(),
-            supplier_docs["rc_city"].isna().sum() + (supplier_docs["rc_city"].fillna("").astype(str).str.strip() == "").sum(),
-            supplier_docs["payment_mode"].isna().sum() + (supplier_docs["payment_mode"].fillna("").astype(str).str.strip() == "").sum(),
-        ]
-    })
-
-    total_spend = docs_df["total_ttc"].fillna(0).sum() if docs_df is not None and not docs_df.empty else 0
-    supplier_spend = supplier_docs["total_ttc"].fillna(0).sum()
-    avg_ticket = supplier_docs["total_ttc"].fillna(0).mean() if len(supplier_docs) else 0
-    avg_vat_rate = np.nan
-    total_ht = supplier_docs["total_ht"].fillna(0).sum()
-    total_tva = supplier_docs["total_tva"].fillna(0).sum()
-    if total_ht > 0:
-        avg_vat_rate = (total_tva / total_ht) * 100
-
-    avg_lines_per_invoice = np.nan
-    if not supplier_lines.empty and len(supplier_docs) > 0:
-        avg_lines_per_invoice = len(supplier_lines) / len(supplier_docs)
-
-    delay_ratio = np.nan
-    avg_late_months = np.nan
-    overdue_amount = np.nan
-    if not supplier_delays.empty:
-        delay_ratio = (supplier_delays["late_months_unpaid"].fillna(0) > 0).mean() * 100
-        avg_late_months = supplier_delays["late_months_unpaid"].fillna(0).mean()
-        overdue_amount = supplier_delays["unpaid_amount"].fillna(0).sum()
-
-    kpis = {
-        "nb_factures": int(len(supplier_docs)),
-        "montant_ttc": supplier_spend,
-        "ticket_moyen": avg_ticket,
-        "part_depenses_pct": (supplier_spend / total_spend * 100) if total_spend > 0 else 0,
-        "total_ht": total_ht,
-        "total_tva": total_tva,
-        "taux_tva_moyen_pct": avg_vat_rate,
-        "nb_lignes": int(len(supplier_lines)) if not supplier_lines.empty else 0,
-        "lignes_par_facture": avg_lines_per_invoice,
-        "doublons_suspects": int(len(audit_duplicates)),
-        "montant_en_retard": overdue_amount,
-        "taux_factures_en_retard_pct": delay_ratio,
-        "retard_moyen_mois": avg_late_months,
-        "champs_manquants": int(missing_fields["Nb manquants"].sum()),
-    }
-
-    return {
-        "docs": supplier_docs,
-        "lines": supplier_lines,
-        "delays": supplier_delays,
-        "monthly": monthly,
-        "top_designations": top_designations,
-        "payment_modes": payment_modes,
-        "doc_types": doc_types,
-        "audit_duplicates": audit_duplicates,
-        "missing_fields": missing_fields,
-        "unit_price_alerts": unit_price_alerts,
-        "line_summary": line_summary,
-        "kpis": kpis,
-    }
-
 # =========================================================
 # LOAD GLOBAL DATA
 # =========================================================
@@ -2080,7 +1828,6 @@ if st.sidebar.button("Déconnexion", use_container_width=True):
     st.session_state["authenticated"] = False
     st.rerun()
 
-
 # =========================================================
 # PAGE ACCUEIL
 # =========================================================
@@ -2097,161 +1844,16 @@ if menu == "Accueil":
     with c4:
         metric_card("Lignes délai paiement", str(len(payment_delay_df)))
 
-    st.markdown("### Pilotage fournisseur")
+    st.markdown("### Paramètres légaux")
+    p1, p2, p3 = st.columns(3)
+    bam_rate_pct = p1.number_input("Taux BAM (%)", min_value=0.0, step=0.1, value=float(params["bam_rate_pct"]))
+    default_delay_days = p2.number_input("Délai par défaut", min_value=0, step=1, value=int(params["default_delay_days"]))
+    max_legal_delay_days = p3.number_input("Délai max légal", min_value=1, step=1, value=int(params["max_legal_delay_days"]))
 
-    supplier_options = []
-    if docs_df is not None and not docs_df.empty and "supplier_name" in docs_df.columns:
-        supplier_options = sorted([x for x in docs_df["supplier_name"].dropna().astype(str).unique().tolist() if x.strip()])
-
-    left_home, right_home = st.columns([1.3, 1])
-    with left_home:
-        selected_supplier = st.selectbox(
-            "Choisir un fournisseur à analyser",
-            options=supplier_options if supplier_options else ["Aucun fournisseur disponible"],
-            index=0,
-        )
-
-    with right_home:
-        st.markdown("#### Paramètres légaux")
-        bam_rate_pct = st.number_input("Taux BAM (%)", min_value=0.0, step=0.1, value=float(params["bam_rate_pct"]))
-        default_delay_days = st.number_input("Délai par défaut", min_value=0, step=1, value=int(params["default_delay_days"]))
-        max_legal_delay_days = st.number_input("Délai max légal", min_value=1, step=1, value=int(params["max_legal_delay_days"]))
-
-        if st.button("Enregistrer les paramètres", use_container_width=True):
-            save_legal_params(bam_rate_pct, default_delay_days, max_legal_delay_days)
-            st.success("Paramètres enregistrés.")
-            st.rerun()
-
-    if not supplier_options:
-        st.info("Importe d'abord des factures pour lancer l'analyse fournisseur.")
-    else:
-        supplier_pack = build_supplier_analysis(docs_df, lines_df, payment_delay_df, selected_supplier)
-        supplier_docs = supplier_pack["docs"]
-        kpis = supplier_pack["kpis"]
-
-        st.markdown(f"## Analyse détaillée - {selected_supplier}")
-
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            metric_card("Montant TTC fournisseur", format_money(kpis.get("montant_ttc")), f"{kpis.get('nb_factures', 0)} facture(s)")
-        with m2:
-            metric_card("Ticket moyen", format_money(kpis.get("ticket_moyen")), f"Part du fournisseur : {round(kpis.get('part_depenses_pct', 0), 2)} %")
-        with m3:
-            metric_card("Taux TVA moyen", f"{round(kpis.get('taux_tva_moyen_pct', 0) or 0, 2)} %", f"{kpis.get('nb_lignes', 0)} ligne(s)")
-        with m4:
-            metric_card("Doublons / anomalies", str(kpis.get("doublons_suspects", 0)), f"Champs manquants : {kpis.get('champs_manquants', 0)}")
-
-        m5, m6, m7, m8 = st.columns(4)
-        with m5:
-            metric_card("Lignes / facture", round(kpis.get("lignes_par_facture", 0) or 0, 2))
-        with m6:
-            metric_card("Montant en retard", format_money(kpis.get("montant_en_retard")), f"Taux retard : {round(kpis.get('taux_factures_en_retard_pct', 0) or 0, 2)} %")
-        with m7:
-            metric_card("Retard moyen", round(kpis.get("retard_moyen_mois", 0) or 0, 2), "en mois")
-        with m8:
-            last_doc_date = supplier_docs["document_date"].max() if not supplier_docs.empty and "document_date" in supplier_docs.columns else None
-            metric_card("Dernière facture", str(last_doc_date.date()) if pd.notna(last_doc_date) else "-", "activité la plus récente")
-
-        st.markdown("### Graphiques de pilotage")
-        g1, g2 = st.columns(2)
-        with g1:
-            monthly = supplier_pack["monthly"]
-            if not monthly.empty:
-                fig = px.line(monthly, x="year_month", y="montant_ttc", markers=True, title="Évolution mensuelle des achats TTC")
-                st.plotly_chart(style_plot(fig), use_container_width=True)
-            else:
-                st.info("Pas assez de données pour la courbe mensuelle.")
-
-        with g2:
-            monthly = supplier_pack["monthly"]
-            if not monthly.empty:
-                fig = px.bar(monthly, x="year_month", y="nb_factures", title="Nombre de factures par mois")
-                st.plotly_chart(style_plot(fig), use_container_width=True)
-            else:
-                st.info("Pas assez de données pour l'histogramme mensuel.")
-
-        g3, g4 = st.columns(2)
-        with g3:
-            payment_modes = supplier_pack["payment_modes"]
-            if not payment_modes.empty:
-                fig = px.pie(payment_modes, names="payment_mode", values="montant_ttc", title="Répartition des montants par mode de paiement")
-                st.plotly_chart(style_plot(fig), use_container_width=True)
-            else:
-                st.info("Modes de paiement non disponibles.")
-
-        with g4:
-            doc_types = supplier_pack["doc_types"]
-            if not doc_types.empty:
-                fig = px.bar(doc_types, x="doc_type", y="montant_ttc", title="Montant TTC par type de document")
-                st.plotly_chart(style_plot(fig), use_container_width=True)
-            else:
-                st.info("Types de documents non disponibles.")
-
-        st.markdown("### Audit et analyse opérationnelle")
-        a1, a2 = st.columns(2)
-        with a1:
-            top_designations = supplier_pack["top_designations"]
-            if not top_designations.empty:
-                fig = px.bar(
-                    top_designations.sort_values("montant_ttc", ascending=True),
-                    x="montant_ttc",
-                    y="designation_clean",
-                    orientation="h",
-                    title="Top désignations / postes de dépense"
-                )
-                st.plotly_chart(style_plot(fig), use_container_width=True)
-            else:
-                st.info("Aucune ligne détaillée disponible.")
-
-        with a2:
-            missing_fields = supplier_pack["missing_fields"]
-            if not missing_fields.empty:
-                fig = px.bar(
-                    missing_fields.sort_values("Nb manquants", ascending=True),
-                    x="Nb manquants",
-                    y="Champ",
-                    orientation="h",
-                    title="Contrôle qualité des données"
-                )
-                st.plotly_chart(style_plot(fig), use_container_width=True)
-
-        st.markdown("### Lecture financière et audit")
-        st.info(
-            "Idées d'analyse incluses : concentration du fournisseur dans les achats, fréquence mensuelle, ticket moyen, contrôle des doublons, "
-            "variations de prix unitaires, qualité des champs légaux, suivi des retards de paiement, et ventilation par type de document / mode de paiement."
-        )
-
-        d1, d2 = st.columns(2)
-        with d1:
-            st.markdown("#### Doublons suspects")
-            audit_duplicates = supplier_pack["audit_duplicates"]
-            if audit_duplicates.empty:
-                st.success("Aucun doublon suspect détecté selon les règles simples du tableau de bord.")
-            else:
-                st.dataframe(audit_duplicates, use_container_width=True, hide_index=True)
-
-        with d2:
-            st.markdown("#### Alertes prix unitaires")
-            unit_price_alerts = supplier_pack["unit_price_alerts"]
-            if unit_price_alerts.empty:
-                st.success("Aucune variation forte de prix unitaire détectée sur les lignes répétées.")
-            else:
-                show_alerts = unit_price_alerts.copy()
-                for c in ["pu_ht_moyen", "pu_ht_min", "pu_ht_max", "ecart_pu_pct"]:
-                    if c in show_alerts.columns:
-                        show_alerts[c] = show_alerts[c].round(2)
-                st.dataframe(show_alerts, use_container_width=True, hide_index=True)
-
-        st.markdown("#### Base fournisseur détaillée")
-        detail_docs = supplier_docs.copy()
-        if not detail_docs.empty:
-            visible_detail_cols = [
-                "source_file", "doc_type", "supplier_name", "invoice_number", "document_date",
-                "due_date", "payment_mode", "total_ht", "total_tva", "total_ttc",
-                "if_number", "ice_number", "rc_number", "head_office_address", "rc_city"
-            ]
-            visible_detail_cols = [c for c in visible_detail_cols if c in detail_docs.columns]
-            st.dataframe(detail_docs[visible_detail_cols], use_container_width=True, hide_index=True)
+    if st.button("Enregistrer les paramètres", use_container_width=True):
+        save_legal_params(bam_rate_pct, default_delay_days, max_legal_delay_days)
+        st.success("Paramètres enregistrés.")
+        st.rerun()
 
 # =========================================================
 # PAGE IMPORT
@@ -2265,56 +1867,29 @@ elif menu == "Import & Extraction":
         accept_multiple_files=True,
     )
 
+    auto_save = st.checkbox("Enregistrer automatiquement chaque facture importée", value=True)
+
     if not azure_is_configured():
         st.warning("Azure n'est pas configuré. Remplis AZURE_DI_ENDPOINT et AZURE_DI_KEY dans le fichier .env pour l'extraction IA.")
         st.stop()
 
-    if "import_cache" not in st.session_state:
-        st.session_state["import_cache"] = {}
-
     if not files:
         st.info("Ajoute des fichiers pour lancer l’extraction.")
     else:
-        st.info("Les fichiers sont bien multiples, mais l'analyse se fait document par document pour éviter les erreurs Azure 429. Les modifications ne sont enregistrées qu'au clic sur Enregistrer.")
-
         for idx, file in enumerate(files, start=1):
             st.markdown(f"### Document {idx} - {file.name}")
+            stored_path = save_uploaded_file(file)
 
-            file_key = f"{file.name}_{file.size}"
-
-            c1, c2 = st.columns([1, 1])
-
-            with c1:
-                if st.button(f"Analyser {file.name}", key=f"analyze_{idx}", use_container_width=True):
-                    stored_path = save_uploaded_file(file)
-                    with st.spinner(f"Analyse Azure de {file.name}..."):
-                        try:
-                            result = azure_analyze_invoice(file.getvalue(), file.name)
-                            doc, lines = normalize_azure_invoice_result(result, file.name, stored_path)
-                            st.session_state["import_cache"][file_key] = {
-                                "doc": doc,
-                                "lines": pd.DataFrame(lines),
-                                "stored_path": stored_path,
-                            }
-                            st.success("Analyse terminée.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Échec d'analyse pour {file.name} : {e}")
-
-            with c2:
-                if st.button(f"Supprimer le brouillon {file.name}", key=f"clear_{idx}", use_container_width=True):
-                    if file_key in st.session_state["import_cache"]:
-                        del st.session_state["import_cache"][file_key]
-                    st.rerun()
-
-            if file_key not in st.session_state["import_cache"]:
-                st.caption("Clique d'abord sur Analyser pour ce document.")
-                continue
-
-            cached = st.session_state["import_cache"][file_key]
-            doc = cached["doc"]
-            stored_path = cached["stored_path"]
-            lines_editor_df = cached["lines"].copy()
+            with st.spinner(f"Analyse Azure de {file.name}..."):
+                try:
+                    doc, lines = normalize_azure_invoice_result(
+                        azure_analyze_invoice(file.getvalue(), file.name),
+                        file.name,
+                        stored_path
+                    )
+                except Exception as e:
+                    st.error(f"Échec d'analyse pour {file.name} : {e}")
+                    continue
 
             doc_editor = pd.DataFrame([{
                 "source_file": doc.get("source_file"),
@@ -2328,12 +1903,15 @@ elif menu == "Import & Extraction":
                 "total_ht": doc.get("total_ht"),
                 "total_tva": doc.get("total_tva"),
                 "total_ttc": doc.get("total_ttc"),
+                "currency": doc.get("currency"),
                 "if_number": doc.get("if_number"),
                 "ice_number": doc.get("ice_number"),
                 "rc_number": doc.get("rc_number"),
                 "head_office_address": doc.get("head_office_address"),
                 "rc_city": doc.get("rc_city"),
             }])
+
+            lines_editor = pd.DataFrame(lines)
 
             with st.expander("Texte brut détecté"):
                 st.text_area(
@@ -2353,48 +1931,53 @@ elif menu == "Import & Extraction":
 
             st.markdown("#### Lignes détaillées")
             edited_lines = st.data_editor(
-                lines_editor_df,
+                lines_editor,
                 use_container_width=True,
                 num_rows="dynamic",
                 key=f"lines_editor_{idx}",
             )
 
+            row0 = edited_doc.iloc[0]
+
+            doc_to_save = {
+                "source_file": file.name,
+                "stored_file_path": stored_path,
+                "doc_type": normalize_text(row0.get("doc_type")),
+                "supplier_name": normalize_text(row0.get("supplier_name")),
+                "issuer_name": normalize_text(row0.get("supplier_name")),
+                "invoice_number": normalize_text(row0.get("invoice_number")),
+                "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
+                "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
+                "client_name": normalize_text(row0.get("client_name")),
+                "payment_mode": normalize_text(row0.get("payment_mode")),
+                "total_ht": parse_numeric_value(row0.get("total_ht")),
+                "total_tva": parse_numeric_value(row0.get("total_tva")),
+                "total_ttc": parse_numeric_value(row0.get("total_ttc")),
+                "currency": normalize_text(row0.get("currency")) or "MAD",
+                "raw_text": doc.get("raw_text", ""),
+                "if_number": normalize_text(row0.get("if_number")),
+                "ice_number": normalize_text(row0.get("ice_number")),
+                "rc_number": normalize_text(row0.get("rc_number")),
+                "head_office_address": normalize_text(row0.get("head_office_address")),
+                "rc_city": normalize_text(row0.get("rc_city")),
+            }
+
+            if not edited_lines.empty:
+                for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
+                    if c in edited_lines.columns:
+                        edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
+
+            auto_save_key = f"auto_saved::{stored_path}"
+
+            if auto_save and not st.session_state.get(auto_save_key, False):
+                doc_id = save_document_to_db(doc_to_save, edited_lines)
+                st.session_state[auto_save_key] = True
+                st.success(f"Document enregistré automatiquement. ID : {doc_id}")
+
             if st.button(f"Enregistrer / mettre à jour {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
-                row0 = edited_doc.iloc[0]
-
-                doc_to_save = {
-                    "source_file": file.name,
-                    "stored_file_path": stored_path,
-                    "doc_type": normalize_text(row0.get("doc_type")),
-                    "supplier_name": normalize_text(row0.get("supplier_name")),
-                    "issuer_name": normalize_text(row0.get("supplier_name")),
-                    "invoice_number": normalize_text(row0.get("invoice_number")),
-                    "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
-                    "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
-                    "client_name": normalize_text(row0.get("client_name")),
-                    "payment_mode": normalize_text(row0.get("payment_mode")),
-                    "total_ht": parse_numeric_value(row0.get("total_ht")),
-                    "total_tva": parse_numeric_value(row0.get("total_tva")),
-                    "total_ttc": parse_numeric_value(row0.get("total_ttc")),
-                    "raw_text": doc.get("raw_text", ""),
-                    "if_number": normalize_text(row0.get("if_number")),
-                    "ice_number": normalize_text(row0.get("ice_number")),
-                    "rc_number": normalize_text(row0.get("rc_number")),
-                    "head_office_address": normalize_text(row0.get("head_office_address")),
-                    "rc_city": normalize_text(row0.get("rc_city")),
-                }
-
-                edited_lines_to_save = edited_lines.copy()
-                if not edited_lines_to_save.empty:
-                    for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
-                        if c in edited_lines_to_save.columns:
-                            edited_lines_to_save[c] = edited_lines_to_save[c].apply(parse_numeric_value)
-
-                doc_id = save_document_to_db(doc_to_save, edited_lines_to_save)
+                doc_id = save_document_to_db(doc_to_save, edited_lines)
+                st.session_state[auto_save_key] = True
                 st.success(f"Document enregistré avec succès. ID : {doc_id}")
-
-                st.session_state["import_cache"][file_key]["doc"] = doc_to_save
-                st.session_state["import_cache"][file_key]["lines"] = edited_lines_to_save
                 st.rerun()
 
 # =========================================================
@@ -2417,7 +2000,7 @@ elif menu == "Base Documents":
     cols = [
         "document_id", "source_file", "supplier_name", "invoice_number",
         "document_date", "payment_mode", "total_ht", "total_tva", "total_ttc",
-        "if_number", "ice_number", "rc_number",
+        "currency", "if_number", "ice_number", "rc_number",
         "head_office_address", "rc_city", "created_at"
     ]
     cols = [c for c in cols if c in show.columns]
@@ -2450,7 +2033,7 @@ elif menu == "Base Documents":
     doc_edit_cols = [
         "source_file", "doc_type", "supplier_name", "invoice_number",
         "document_date", "due_date", "client_name", "payment_mode",
-        "total_ht", "total_tva", "total_ttc",
+        "total_ht", "total_tva", "total_ttc", "currency",
         "if_number", "ice_number", "rc_number",
         "head_office_address", "rc_city"
     ]
