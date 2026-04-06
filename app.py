@@ -15,6 +15,12 @@ import plotly.express as px
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+import psycopg2
+from psycopg2.extras import RealDictCursor
+DATABASE_URL = st.secrets["DATABASE_URL"]
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # =========================================================
 # CONFIG
@@ -29,10 +35,13 @@ AZURE_DI_API_VERSION = (os.getenv("AZURE_DI_API_VERSION") or "2024-11-30").strip
 GOOGLE_CSE_API_KEY = (os.getenv("GOOGLE_CSE_API_KEY") or "").strip()
 GOOGLE_CSE_CX = (os.getenv("GOOGLE_CSE_CX") or "").strip()
 
-DB_FILE = "edd_exp_azure.db"
-UPLOAD_DIR = "uploaded_docs"
-Path(UPLOAD_DIR).mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+UPLOAD_DIR = DATA_DIR / "uploaded_docs"
+DB_FILE = DATA_DIR / "edd_exp_azure.db"
 
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 st.set_page_config(
     page_title="EDDAQAQ EXP",
     page_icon="📊",
@@ -239,10 +248,10 @@ def safe_filename(name):
 
 def save_uploaded_file(uploaded_file):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out = os.path.join(UPLOAD_DIR, f"{stamp}_{safe_filename(uploaded_file.name)}")
+    out = UPLOAD_DIR / f"{stamp}_{safe_filename(uploaded_file.name)}"
     with open(out, "wb") as f:
         f.write(uploaded_file.getvalue())
-    return out
+    return str(out)
 
 def infer_doc_type_from_name(name: str) -> str:
     n = normalize_for_matching(name)
@@ -266,9 +275,10 @@ def ceil_precise(x):
 # DB
 # =========================================================
 def get_db_connection():
-    con = sqlite3.connect(DB_FILE, check_same_thread=False)
+    con = sqlite3.connect(str(DB_FILE), check_same_thread=False)
     con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA synchronous=FULL;")
+    con.execute("PRAGMA foreign_keys=ON;")
     return con
 
 def safe_add_column(cur, table_name, column_name, column_type="TEXT"):
@@ -309,6 +319,15 @@ def init_db():
         )
         """
     )
+cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_unique_invoice
+    ON documents_achats (
+        supplier_name,
+        invoice_number,
+        document_date,
+        total_ttc
+    )
+""")
 
     for col in ["if_number", "ice_number", "rc_number", "head_office_address", "rc_city"]:
         safe_add_column(cur, "documents_achats", col, "TEXT")
@@ -1154,43 +1173,120 @@ def save_document_to_db(doc, lines_df):
     con = get_db_connection()
     cur = con.cursor()
 
-    document_id = str(uuid.uuid4())
-    now = datetime.now().isoformat(timespec="seconds")
+    supplier_name = normalize_text(doc.get("supplier_name"))
+    invoice_number = normalize_text(doc.get("invoice_number"))
+    document_date = parse_date_fr(doc.get("document_date")) if doc.get("document_date") else None
+    total_ttc = parse_numeric_value(doc.get("total_ttc"))
 
+    # Vérifie si la facture existe déjà
     cur.execute(
         """
-        INSERT INTO documents_achats (
-            document_id, source_file, stored_file_path, doc_type, supplier_name,
-            issuer_name, invoice_number, document_date, due_date, client_name,
-            payment_mode, total_ht, total_tva, total_ttc, currency, raw_text,
-            if_number, ice_number, rc_number, head_office_address, rc_city, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        SELECT document_id
+        FROM documents_achats
+        WHERE COALESCE(supplier_name, '') = COALESCE(?, '')
+          AND COALESCE(invoice_number, '') = COALESCE(?, '')
+          AND COALESCE(document_date, '') = COALESCE(?, '')
+          AND COALESCE(total_ttc, -999999999) = COALESCE(?, -999999999)
+        LIMIT 1
         """,
-        (
-            document_id,
-            doc.get("source_file"),
-            doc.get("stored_file_path"),
-            doc.get("doc_type"),
-            doc.get("supplier_name"),
-            doc.get("issuer_name"),
-            doc.get("invoice_number"),
-            doc.get("document_date"),
-            doc.get("due_date"),
-            doc.get("client_name"),
-            doc.get("payment_mode"),
-            float(doc.get("total_ht")) if pd.notna(doc.get("total_ht")) else None,
-            float(doc.get("total_tva")) if pd.notna(doc.get("total_tva")) else None,
-            float(doc.get("total_ttc")) if pd.notna(doc.get("total_ttc")) else None,
-            doc.get("currency"),
-            doc.get("raw_text"),
-            doc.get("if_number"),
-            doc.get("ice_number"),
-            doc.get("rc_number"),
-            doc.get("head_office_address"),
-            doc.get("rc_city"),
-            now,
-        ),
+        (supplier_name, invoice_number, document_date, total_ttc),
     )
+    existing = cur.fetchone()
+
+    now = datetime.now().isoformat(timespec="seconds")
+
+    if existing:
+        document_id = existing[0]
+
+        cur.execute(
+            """
+            UPDATE documents_achats
+            SET
+                source_file = ?,
+                stored_file_path = ?,
+                doc_type = ?,
+                supplier_name = ?,
+                issuer_name = ?,
+                invoice_number = ?,
+                document_date = ?,
+                due_date = ?,
+                client_name = ?,
+                payment_mode = ?,
+                total_ht = ?,
+                total_tva = ?,
+                total_ttc = ?,
+                currency = ?,
+                raw_text = ?,
+                if_number = ?,
+                ice_number = ?,
+                rc_number = ?,
+                head_office_address = ?,
+                rc_city = ?
+            WHERE document_id = ?
+            """,
+            (
+                doc.get("source_file"),
+                doc.get("stored_file_path"),
+                doc.get("doc_type"),
+                supplier_name,
+                doc.get("issuer_name"),
+                invoice_number,
+                document_date,
+                parse_date_fr(doc.get("due_date")) if doc.get("due_date") else None,
+                normalize_text(doc.get("client_name")),
+                normalize_text(doc.get("payment_mode")),
+                float(doc.get("total_ht")) if pd.notna(doc.get("total_ht")) else None,
+                float(doc.get("total_tva")) if pd.notna(doc.get("total_tva")) else None,
+                float(total_ttc) if pd.notna(total_ttc) else None,
+                normalize_text(doc.get("currency")) or "MAD",
+                doc.get("raw_text"),
+                normalize_text(doc.get("if_number")),
+                normalize_text(doc.get("ice_number")),
+                normalize_text(doc.get("rc_number")),
+                normalize_text(doc.get("head_office_address")),
+                normalize_text(doc.get("rc_city")),
+                document_id,
+            ),
+        )
+
+        cur.execute("DELETE FROM document_lines WHERE document_id = ?", (document_id,))
+    else:
+        document_id = str(uuid.uuid4())
+
+        cur.execute(
+            """
+            INSERT INTO documents_achats (
+                document_id, source_file, stored_file_path, doc_type, supplier_name,
+                issuer_name, invoice_number, document_date, due_date, client_name,
+                payment_mode, total_ht, total_tva, total_ttc, currency, raw_text,
+                if_number, ice_number, rc_number, head_office_address, rc_city, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document_id,
+                doc.get("source_file"),
+                doc.get("stored_file_path"),
+                doc.get("doc_type"),
+                supplier_name,
+                doc.get("issuer_name"),
+                invoice_number,
+                document_date,
+                parse_date_fr(doc.get("due_date")) if doc.get("due_date") else None,
+                normalize_text(doc.get("client_name")),
+                normalize_text(doc.get("payment_mode")),
+                float(doc.get("total_ht")) if pd.notna(doc.get("total_ht")) else None,
+                float(doc.get("total_tva")) if pd.notna(doc.get("total_tva")) else None,
+                float(total_ttc) if pd.notna(total_ttc) else None,
+                normalize_text(doc.get("currency")) or "MAD",
+                doc.get("raw_text"),
+                normalize_text(doc.get("if_number")),
+                normalize_text(doc.get("ice_number")),
+                normalize_text(doc.get("rc_number")),
+                normalize_text(doc.get("head_office_address")),
+                normalize_text(doc.get("rc_city")),
+                now,
+            ),
+        )
 
     if lines_df is not None and not lines_df.empty:
         for _, row in lines_df.iterrows():
@@ -1765,6 +1861,7 @@ elif menu == "Import & Extraction":
         type=["pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
         accept_multiple_files=True,
     )
+    auto_save = st.checkbox("Enregistrer automatiquement chaque facture importée", value=True)
 
     if not azure_is_configured():
         st.warning("Azure n'est pas configuré. Remplis AZURE_DI_ENDPOINT et AZURE_DI_KEY dans le fichier .env pour l'extraction IA.")
@@ -1834,40 +1931,44 @@ elif menu == "Import & Extraction":
                 key=f"lines_editor_{idx}",
             )
 
-            if st.button(f"Enregistrer {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
-                row0 = edited_doc.iloc[0]
+            row0 = edited_doc.iloc[0]
 
-                doc_to_save = {
-                    "source_file": file.name,
-                    "stored_file_path": stored_path,
-                    "doc_type": normalize_text(row0.get("doc_type")),
-                    "supplier_name": normalize_text(row0.get("supplier_name")),
-                    "issuer_name": normalize_text(row0.get("supplier_name")),
-                    "invoice_number": normalize_text(row0.get("invoice_number")),
-                    "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
-                    "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
-                    "client_name": normalize_text(row0.get("client_name")),
-                    "payment_mode": normalize_text(row0.get("payment_mode")),
-                    "total_ht": parse_numeric_value(row0.get("total_ht")),
-                    "total_tva": parse_numeric_value(row0.get("total_tva")),
-                    "total_ttc": parse_numeric_value(row0.get("total_ttc")),
-                    "currency": normalize_text(row0.get("currency")) or "MAD",
-                    "raw_text": doc.get("raw_text", ""),
-                    "if_number": normalize_text(row0.get("if_number")),
-                    "ice_number": normalize_text(row0.get("ice_number")),
-                    "rc_number": normalize_text(row0.get("rc_number")),
-                    "head_office_address": normalize_text(row0.get("head_office_address")),
-                    "rc_city": normalize_text(row0.get("rc_city")),
-                }
+doc_to_save = {
+    "source_file": file.name,
+    "stored_file_path": stored_path,
+    "doc_type": normalize_text(row0.get("doc_type")),
+    "supplier_name": normalize_text(row0.get("supplier_name")),
+    "issuer_name": normalize_text(row0.get("supplier_name")),
+    "invoice_number": normalize_text(row0.get("invoice_number")),
+    "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
+    "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
+    "client_name": normalize_text(row0.get("client_name")),
+    "payment_mode": normalize_text(row0.get("payment_mode")),
+    "total_ht": parse_numeric_value(row0.get("total_ht")),
+    "total_tva": parse_numeric_value(row0.get("total_tva")),
+    "total_ttc": parse_numeric_value(row0.get("total_ttc")),
+    "currency": normalize_text(row0.get("currency")) or "MAD",
+    "raw_text": doc.get("raw_text", ""),
+    "if_number": normalize_text(row0.get("if_number")),
+    "ice_number": normalize_text(row0.get("ice_number")),
+    "rc_number": normalize_text(row0.get("rc_number")),
+    "head_office_address": normalize_text(row0.get("head_office_address")),
+    "rc_city": normalize_text(row0.get("rc_city")),
+}
 
-                if not edited_lines.empty:
-                    for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
-                        if c in edited_lines.columns:
-                            edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
+if not edited_lines.empty:
+    for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
+        if c in edited_lines.columns:
+            edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
 
-                doc_id = save_document_to_db(doc_to_save, edited_lines)
-                st.success(f"Document enregistré avec succès. ID : {doc_id}")
-                st.rerun()
+if auto_save:
+    doc_id = save_document_to_db(doc_to_save, edited_lines)
+    st.success(f"Facture enregistrée automatiquement. ID : {doc_id}")
+else:
+    if st.button(f"Enregistrer {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
+        doc_id = save_document_to_db(doc_to_save, edited_lines)
+        st.success(f"Document enregistré avec succès. ID : {doc_id}")
+        st.rerun()
 
 # =========================================================
 # PAGE BASE DOCUMENTS
