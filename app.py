@@ -35,7 +35,7 @@ UPLOAD_DIR = "uploaded_docs"
 Path(UPLOAD_DIR).mkdir(exist_ok=True)
 
 st.set_page_config(
-    page_title="EDDAQAQ EXP",
+    page_title="EDDAQAQ EXPERTISES",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
