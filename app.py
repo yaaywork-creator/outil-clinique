@@ -1959,51 +1959,21 @@ elif menu == "Import & Extraction":
                 "head_office_address": normalize_text(row0.get("head_office_address")),
                 "rc_city": normalize_text(row0.get("rc_city")),
             }
-            if st.button(f"Enregistrer {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
-    row0 = edited_doc.iloc[0]
 
-    doc_to_save = {
-        "source_file": file.name,
-        "stored_file_path": stored_path,
-        "doc_type": normalize_text(row0.get("doc_type")),
-        "supplier_name": normalize_text(row0.get("supplier_name")),
-        "issuer_name": normalize_text(row0.get("supplier_name")),
-        "invoice_number": normalize_text(row0.get("invoice_number")),
-        "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
-        "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
-        "client_name": normalize_text(row0.get("client_name")),
-        "payment_mode": normalize_text(row0.get("payment_mode")),
-        "total_ht": parse_numeric_value(row0.get("total_ht")),
-        "total_tva": parse_numeric_value(row0.get("total_tva")),
-        "total_ttc": parse_numeric_value(row0.get("total_ttc")),
-        "currency": normalize_text(row0.get("currency")) or "MAD",
-        "raw_text": doc.get("raw_text", ""),
-        "if_number": normalize_text(row0.get("if_number")),
-        "ice_number": normalize_text(row0.get("ice_number")),
-        "rc_number": normalize_text(row0.get("rc_number")),
-        "head_office_address": normalize_text(row0.get("head_office_address")),
-        "rc_city": normalize_text(row0.get("rc_city")),
-    }
-
-    edited_lines_to_save = edited_lines.copy()
-
-    if not edited_lines_to_save.empty:
-        for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
-            if c in edited_lines_to_save.columns:
-                edited_lines_to_save[c] = edited_lines_to_save[c].apply(parse_numeric_value)
-
-    doc_id = save_document_to_db(doc_to_save, edited_lines_to_save)
-    st.success(f"Document enregistré avec succès. ID : {doc_id}")
-    st.rerun()
             if not edited_lines.empty:
                 for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
                     if c in edited_lines.columns:
                         edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
 
-            auto_save_key = f"auto_saved::{stored_path}"
+            if st.button(f"Enregistrer {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
+                edited_lines_to_save = edited_lines.copy()
 
-            if st.button(f"Enregistrer / mettre à jour {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
-                doc_id = save_document_to_db(doc_to_save, edited_lines)
+                if not edited_lines_to_save.empty:
+                    for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
+                        if c in edited_lines_to_save.columns:
+                            edited_lines_to_save[c] = edited_lines_to_save[c].apply(parse_numeric_value)
+
+                doc_id = save_document_to_db(doc_to_save, edited_lines_to_save)
                 st.success(f"Document enregistré avec succès. ID : {doc_id}")
                 st.rerun()
 
