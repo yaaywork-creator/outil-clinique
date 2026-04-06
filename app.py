@@ -4,6 +4,7 @@ import hmac
 import uuid
 import time
 import math
+import random
 import sqlite3
 from io import BytesIO
 from pathlib import Path
@@ -570,22 +571,57 @@ def azure_begin_invoice_analysis(file_bytes: bytes, filename: str) -> str:
         "Ocp-Apim-Subscription-Key": AZURE_DI_KEY,
         "Content-Type": guess_content_type_from_name(filename),
     }
-    resp = requests.post(url, headers=headers, data=file_bytes, timeout=120)
-    resp.raise_for_status()
-    operation_location = resp.headers.get("Operation-Location")
-    if not operation_location:
-        raise RuntimeError("Azure n'a pas renvoyé Operation-Location.")
-    return operation_location
 
-def azure_poll_result(operation_location: str, timeout_seconds: int = 180) -> dict:
+    delay = 2
+    max_attempts = 6
+
+    for attempt in range(max_attempts):
+        resp = requests.post(url, headers=headers, data=file_bytes, timeout=120)
+
+        if resp.status_code in (200, 201, 202):
+            operation_location = resp.headers.get("Operation-Location")
+            if not operation_location:
+                raise RuntimeError("Azure n'a pas renvoyé Operation-Location.")
+            return operation_location
+
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait_time = int(retry_after) if retry_after and str(retry_after).isdigit() else delay
+            time.sleep(wait_time + random.uniform(0, 1))
+            delay = min(delay * 2, 30)
+            continue
+
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Erreur Azure analyse ({resp.status_code}) : {resp.text}") from e
+
+    raise RuntimeError("Azure a rejeté trop de requêtes. Réessaie dans quelques secondes.")
+
+def azure_poll_result(operation_location: str, timeout_seconds: int = 300) -> dict:
     start = time.time()
+    delay = 2
+    max_delay = 15
+
     while True:
         resp = requests.get(
             operation_location,
             headers={"Ocp-Apim-Subscription-Key": AZURE_DI_KEY},
             timeout=120,
         )
-        resp.raise_for_status()
+
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait_time = int(retry_after) if retry_after and str(retry_after).isdigit() else delay
+            time.sleep(wait_time)
+            delay = min(delay * 2, max_delay)
+            continue
+
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Erreur Azure polling ({resp.status_code}) : {resp.text}") from e
+
         data = resp.json()
         status = data.get("status", "").lower()
 
@@ -593,13 +629,21 @@ def azure_poll_result(operation_location: str, timeout_seconds: int = 180) -> di
             return data
         if status == "failed":
             raise RuntimeError(f"Azure a échoué : {data}")
+
         if time.time() - start > timeout_seconds:
             raise TimeoutError("Délai dépassé pendant l'analyse Azure.")
-        time.sleep(2)
+
+        time.sleep(delay)
+        delay = min(delay + 1, max_delay)
 
 def azure_analyze_invoice(file_bytes: bytes, filename: str) -> dict:
     operation_location = azure_begin_invoice_analysis(file_bytes, filename)
     return azure_poll_result(operation_location)
+
+def uploaded_file_signature(uploaded_file) -> str:
+    raw = uploaded_file.getvalue()
+    base = f"{uploaded_file.name}|{len(raw)}|{hash(raw)}"
+    return safe_filename(base)
 
 def get_field_obj(fields: dict, candidates: list):
     if not isinstance(fields, dict):
@@ -1867,6 +1911,11 @@ elif menu == "Import & Extraction":
         accept_multiple_files=True,
     )
 
+    if "import_analysis_cache" not in st.session_state:
+        st.session_state["import_analysis_cache"] = {}
+
+    analysis_cache = st.session_state["import_analysis_cache"]
+
     if not azure_is_configured():
         st.warning("Azure n'est pas configuré. Remplis AZURE_DI_ENDPOINT et AZURE_DI_KEY dans le fichier .env pour l'extraction IA.")
         st.stop()
@@ -1874,20 +1923,105 @@ elif menu == "Import & Extraction":
     if not files:
         st.info("Ajoute des fichiers pour lancer l’extraction.")
     else:
-        for idx, file in enumerate(files, start=1):
-            st.markdown(f"### Document {idx} - {file.name}")
-            stored_path = save_uploaded_file(file)
+        st.info("Le site n'enregistre rien pendant tes modifications. L'enregistrement ne se fait que lorsque tu cliques sur le bouton Enregistrer du document concerné.")
 
-            with st.spinner(f"Analyse Azure de {file.name}..."):
-                try:
-                    doc, lines = normalize_azure_invoice_result(
-                        azure_analyze_invoice(file.getvalue(), file.name),
-                        file.name,
-                        stored_path
-                    )
-                except Exception as e:
-                    st.error(f"Échec d'analyse pour {file.name} : {e}")
+        col_batch1, col_batch2 = st.columns(2)
+        with col_batch1:
+            analyze_all = st.button("Analyser tous les nouveaux documents", use_container_width=True)
+        with col_batch2:
+            if st.button("Vider le cache d'analyse", use_container_width=True):
+                st.session_state["import_analysis_cache"] = {}
+                st.rerun()
+
+        if analyze_all:
+            progress = st.progress(0)
+            total = len(files)
+            analyzed_count = 0
+
+            for idx, file in enumerate(files, start=1):
+                signature = uploaded_file_signature(file)
+                if signature in analysis_cache and analysis_cache[signature].get("status") == "success":
+                    progress.progress(idx / total)
                     continue
+
+                stored_path = save_uploaded_file(file)
+
+                try:
+                    with st.spinner(f"Analyse Azure de {file.name}..."):
+                        result = azure_analyze_invoice(file.getvalue(), file.name)
+                        doc, lines = normalize_azure_invoice_result(result, file.name, stored_path)
+
+                    analysis_cache[signature] = {
+                        "status": "success",
+                        "stored_path": stored_path,
+                        "doc": doc,
+                        "lines": lines,
+                        "error": None,
+                    }
+                    analyzed_count += 1
+                    time.sleep(1.2)
+                except Exception as e:
+                    analysis_cache[signature] = {
+                        "status": "error",
+                        "stored_path": stored_path,
+                        "doc": None,
+                        "lines": None,
+                        "error": str(e),
+                    }
+
+                progress.progress(idx / total)
+
+            st.success(f"Analyse terminée. {analyzed_count} nouveau(x) document(s) traité(s).")
+            st.rerun()
+
+        for idx, file in enumerate(files, start=1):
+            signature = uploaded_file_signature(file)
+            cache_item = analysis_cache.get(signature)
+
+            st.markdown(f"### Document {idx} - {file.name}")
+
+            top1, top2 = st.columns([1, 2])
+            with top1:
+                if st.button(f"Analyser {file.name}", key=f"analyze_{signature}", use_container_width=True):
+                    stored_path = save_uploaded_file(file)
+                    try:
+                        with st.spinner(f"Analyse Azure de {file.name}..."):
+                            result = azure_analyze_invoice(file.getvalue(), file.name)
+                            doc, lines = normalize_azure_invoice_result(result, file.name, stored_path)
+
+                        analysis_cache[signature] = {
+                            "status": "success",
+                            "stored_path": stored_path,
+                            "doc": doc,
+                            "lines": lines,
+                            "error": None,
+                        }
+                        st.success("Analyse terminée.")
+                        st.rerun()
+                    except Exception as e:
+                        analysis_cache[signature] = {
+                            "status": "error",
+                            "stored_path": stored_path,
+                            "doc": None,
+                            "lines": None,
+                            "error": str(e),
+                        }
+                        st.error(f"Échec d'analyse pour {file.name} : {e}")
+
+            with top2:
+                if cache_item and cache_item.get("status") == "success":
+                    st.success("Document déjà analysé. Tu peux modifier puis enregistrer.")
+                elif cache_item and cache_item.get("status") == "error":
+                    st.error(f"Dernière erreur d'analyse : {cache_item.get('error')}")
+                else:
+                    st.info("Clique sur Analyser pour préparer ce document.")
+
+            if not cache_item or cache_item.get("status") != "success":
+                continue
+
+            doc = cache_item["doc"]
+            lines = cache_item["lines"]
+            stored_path = cache_item["stored_path"]
 
             doc_editor = pd.DataFrame([{
                 "source_file": doc.get("source_file"),
@@ -1911,12 +2045,12 @@ elif menu == "Import & Extraction":
 
             lines_editor = pd.DataFrame(lines)
 
-            with st.expander("Texte brut détecté"):
+            with st.expander(f"Texte brut détecté - {file.name}"):
                 st.text_area(
                     "Texte détecté par Azure",
                     doc.get("raw_text", ""),
                     height=300,
-                    key=f"raw_text_{idx}",
+                    key=f"raw_text_{signature}",
                 )
 
             st.markdown("#### En-tête document")
@@ -1924,7 +2058,7 @@ elif menu == "Import & Extraction":
                 doc_editor,
                 use_container_width=True,
                 num_rows="fixed",
-                key=f"doc_editor_{idx}",
+                key=f"doc_editor_{signature}",
             )
 
             st.markdown("#### Lignes détaillées")
@@ -1932,40 +2066,35 @@ elif menu == "Import & Extraction":
                 lines_editor,
                 use_container_width=True,
                 num_rows="dynamic",
-                key=f"lines_editor_{idx}",
+                key=f"lines_editor_{signature}",
             )
 
-            row0 = edited_doc.iloc[0]
+            if st.button(f"Enregistrer {file.name}", use_container_width=True, key=f"save_btn_{signature}"):
+                row0 = edited_doc.iloc[0]
 
-            doc_to_save = {
-                "source_file": file.name,
-                "stored_file_path": stored_path,
-                "doc_type": normalize_text(row0.get("doc_type")),
-                "supplier_name": normalize_text(row0.get("supplier_name")),
-                "issuer_name": normalize_text(row0.get("supplier_name")),
-                "invoice_number": normalize_text(row0.get("invoice_number")),
-                "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
-                "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
-                "client_name": normalize_text(row0.get("client_name")),
-                "payment_mode": normalize_text(row0.get("payment_mode")),
-                "total_ht": parse_numeric_value(row0.get("total_ht")),
-                "total_tva": parse_numeric_value(row0.get("total_tva")),
-                "total_ttc": parse_numeric_value(row0.get("total_ttc")),
-                "currency": normalize_text(row0.get("currency")) or "MAD",
-                "raw_text": doc.get("raw_text", ""),
-                "if_number": normalize_text(row0.get("if_number")),
-                "ice_number": normalize_text(row0.get("ice_number")),
-                "rc_number": normalize_text(row0.get("rc_number")),
-                "head_office_address": normalize_text(row0.get("head_office_address")),
-                "rc_city": normalize_text(row0.get("rc_city")),
-            }
+                doc_to_save = {
+                    "source_file": file.name,
+                    "stored_file_path": stored_path,
+                    "doc_type": normalize_text(row0.get("doc_type")),
+                    "supplier_name": normalize_text(row0.get("supplier_name")),
+                    "issuer_name": normalize_text(row0.get("supplier_name")),
+                    "invoice_number": normalize_text(row0.get("invoice_number")),
+                    "document_date": parse_date_fr(row0.get("document_date")) if row0.get("document_date") else None,
+                    "due_date": parse_date_fr(row0.get("due_date")) if row0.get("due_date") else None,
+                    "client_name": normalize_text(row0.get("client_name")),
+                    "payment_mode": normalize_text(row0.get("payment_mode")),
+                    "total_ht": parse_numeric_value(row0.get("total_ht")),
+                    "total_tva": parse_numeric_value(row0.get("total_tva")),
+                    "total_ttc": parse_numeric_value(row0.get("total_ttc")),
+                    "currency": normalize_text(row0.get("currency")) or "MAD",
+                    "raw_text": doc.get("raw_text", ""),
+                    "if_number": normalize_text(row0.get("if_number")),
+                    "ice_number": normalize_text(row0.get("ice_number")),
+                    "rc_number": normalize_text(row0.get("rc_number")),
+                    "head_office_address": normalize_text(row0.get("head_office_address")),
+                    "rc_city": normalize_text(row0.get("rc_city")),
+                }
 
-            if not edited_lines.empty:
-                for c in ["quantity", "unit_price_ht", "unit_price_ttc", "line_amount_ht", "line_amount_ttc"]:
-                    if c in edited_lines.columns:
-                        edited_lines[c] = edited_lines[c].apply(parse_numeric_value)
-
-            if st.button(f"Enregistrer {file.name}", use_container_width=True, key=f"save_btn_{idx}"):
                 edited_lines_to_save = edited_lines.copy()
 
                 if not edited_lines_to_save.empty:
@@ -1975,6 +2104,13 @@ elif menu == "Import & Extraction":
 
                 doc_id = save_document_to_db(doc_to_save, edited_lines_to_save)
                 st.success(f"Document enregistré avec succès. ID : {doc_id}")
+
+                analysis_cache[signature]["doc"] = {
+                    **doc_to_save,
+                    "raw_text": doc.get("raw_text", ""),
+                }
+                analysis_cache[signature]["lines"] = edited_lines_to_save.to_dict("records")
+
                 st.rerun()
 
 # =========================================================
