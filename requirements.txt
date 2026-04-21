@@ -10,3 +10,4 @@ duckdb
 python-dotenv
 beautifulsoup4
 psycopg2-binary
+xlrd
